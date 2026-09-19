@@ -4,7 +4,7 @@ import { SessionCache } from './cache/session.js';
 import { Preferences } from './config/preferences.js';
 import { buildStatsReport } from './stats/report.js';
 import { ExerciseTUI, KAODES_HELP } from './tui/exercise.js';
-import { parseHighlightBlock } from './tui/highlight.js';
+import { parseHighlightBlock, parseLooseHighlight } from './tui/highlight.js';
 import { PAGED_SELECT_BACK, pagedSelect } from './tui/pagedSelect.js';
 import { AiTutorEngine } from './tutor/engine.js';
 import { ChapterPracticeNode, PracticeSession } from './types.js';
@@ -652,7 +652,8 @@ export class KaodesExtension {
         .map((block) => block.text)
         .join('')
         .trim();
-      const terms = parseHighlightBlock(text);
+      // 使用宽松解析：容忍多种格式（冒号分隔、JSON、纯文本列表等）
+      const terms = parseLooseHighlight(text);
       if (terms.length) exer.llmMarks = terms;
     } catch {
       // 忽略异常，不影响主流程

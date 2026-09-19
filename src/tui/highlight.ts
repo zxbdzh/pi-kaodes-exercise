@@ -196,3 +196,58 @@ export function parseHighlightBlock(answer: string): HighlightTerm[] {
   }
   return out;
 }
+
+/**
+ * 宽松抽取：容忍多种输出格式（冒号分隔、JSON、纯文本列表等）。
+ * 用于兜底抽取请求的响应解析。
+ */
+export function parseLooseHighlight(text: string): HighlightTerm[] {
+  if (!text) return [];
+  const out: HighlightTerm[] = [];
+
+  // 1. 先尝试标准【高亮】块
+  const standard = parseHighlightBlock(text);
+  if (standard.length) return standard;
+
+  // 2. 尝试 JSON 格式：{"题眼":["xxx","yyy"],"易错":["zzz"],"结论":["aaa"]}
+  try {
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      const obj = JSON.parse(jsonMatch[0]) as Record<string, string[]>;
+      for (const [label, words] of Object.entries(obj)) {
+        if (!Array.isArray(words)) continue;
+        const kind = kindOfLabel(label);
+        if (!kind) continue;
+        for (const w of words) {
+          if (w.length >= 2 && w.length <= 12) out.push({ term: w, kind });
+        }
+      }
+      if (out.length) return out;
+    }
+  } catch {
+    // 忽略 JSON 解析错误
+  }
+
+  // 3. 尝试纯文本列表：题眼：xxx,yyy；易错：zzz；结论：aaa
+  const labelPattern = /(题眼 | 关键 | 考点|重点 | 易错 | 陷阱 | 错误 | 设问 | 结论 | 落点 | 答案 | 因此)/gi;
+  const matches = text.match(new RegExp(`${labelPattern.source}[^;；\n]*`, 'g'));
+  if (matches) {
+    for (const m of matches) {
+      const kind = kindOfLabel(m.split(/[:：]/)[0]);
+      if (!kind) continue;
+      const terms = m.split(/[:：]/).slice(1).join('').split(/[,，、\s]+/);
+      for (const raw of terms) {
+        const term = raw.trim();
+        if (term.length >= 2 && term.length <= 12) out.push({ term, kind });
+      }
+    }
+    if (out.length) return out;
+  }
+
+  // 4. 最后尝试从整个回答中找常见考点词（回退方案）
+  const commonWords = ['根本', '本质', '核心', '关键', '前提', '必然要求', '内在要求', '必由之路'];
+  for (const word of commonWords) {
+    if (text.includes(word)) out.push({ term: word, kind: 'key' });
+  }
+  return out;
+}
