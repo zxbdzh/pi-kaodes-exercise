@@ -400,13 +400,12 @@ export class ExerciseTUI {
 
     if (cur.viewAnswer) {
       lines.push({ text: '', color: 'text' });
-      lines.push({
-        text: `答案  ${cur.rightKey || (cur.rightKeyList ? cur.rightKeyList.join('') : '详见解析')}`,
-        color: 'accent',
-      });
+      const rightKeyLine = `答案  ${cur.rightKey || (cur.rightKeyList ? cur.rightKeyList.join('') : '详见解析')}`;
+      lines.push({ text: rightKeyLine, color: 'accent', marks: marksOf(rightKeyLine) });
       if (cur.analyze) {
         const analyzeText = `解析  ${cur.analyze}`;
-        lines.push({ text: analyzeText, color: 'text', marks: marksOf(analyzeText) });
+        // 解析部分强制用 fixed ANSI 配色，不受主题灰色影响
+        lines.push({ text: analyzeText, color: 'fixed', marks: marksOf(analyzeText) });
       }
     }
 
@@ -656,7 +655,10 @@ export class ExerciseTUI {
       return 'base';
     };
     const paintRun = (tag: string, text: string): string => {
-      if (tag === 'base') return paint(baseColor, text);
+      if (tag === 'base') {
+        // 解析部分（color='fixed'）用固定灰色，其他用主题色
+        return baseColor === 'fixed' ? `\x1b[90m${text}\x1b[0m` : paint(baseColor, text);
+      }
       if (tag === 'dim') return `${DIM_ANSI}${text}${RESET_ANSI}`;
       const kind = tag.slice(5) as Mark['kind'];
       return `${markAnsi(kind)}${text}${RESET_ANSI}`;
