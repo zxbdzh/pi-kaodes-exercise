@@ -553,6 +553,7 @@ export class KaodesExtension {
   /**
    * 快速问 AI：输入问题 → LLM 回答；回答含【记忆卡】时提示按 C 查看。
    * AI 回答里若带【高亮】块，则顺带把考点词缓存到当前题（第二阶段 LLM 高亮，零额外调用）。
+   * 若主回答未返回【高亮】，会触发一次轻量兜底抽取（额外 token）。
    */
   private async tutorInPi(
     exer: import('./types.js').ExerciseItem,
@@ -562,7 +563,7 @@ export class KaodesExtension {
     if (mode === 'hint') {
       // 一键点拨：直接让 AI 分析当前题（不剧透答案）
       const raw = await this.askPiLLM(commandContext, this.tutor.buildHintPrompt(exer));
-      this.applyLlmHighlight(exer, raw);
+      await this.applyLlmHighlight(exer, raw, commandContext);
       const hint = raw ? stripHighlightBlock(raw) : null;
       commandContext.ui.notify(hint || this.tutor.generateFallbackHint(exer), 'info');
       return;
@@ -586,7 +587,7 @@ export class KaodesExtension {
       commandContext.ui.notify('AI 暂不可用（无可用模型或调用失败），可稍后重试。', 'warning');
       return;
     }
-    this.applyLlmHighlight(exer, raw);
+    await this.applyLlmHighlight(exer, raw, commandContext);
     const answer = stripHighlightBlock(raw);
     this.lastAiAnswer = answer;
     commandContext.ui.notify(answer, 'info');
@@ -595,11 +596,67 @@ export class KaodesExtension {
     }
   }
 
-  /** 从 AI 回答解析【高亮】词并缓存到当前题；无该块则保持既有高亮不变。 */
-  private applyLlmHighlight(exer: import('./types.js').ExerciseItem, answer: string | null): void {
+  /**
+   * 从 AI 回答解析【高亮】词并缓存到当前题；无该块则保持既有高亮不变。
+   * 若主回答未返回【高亮】，会触发一次轻量兜底抽取（额外 token）。
+   */
+  private async applyLlmHighlight(
+    exer: import('./types.js').ExerciseItem,
+    answer: string | null,
+    commandContext: PiCommandContext
+  ): Promise<void> {
     if (!answer) return;
     const terms = parseHighlightBlock(answer);
-    if (terms.length) exer.llmMarks = terms;
+    if (terms.length) {
+      exer.llmMarks = terms;
+      return;
+    }
+    // 兜底：主回答没带【高亮】，发一次极简抽取请求
+    try {
+      await this.doMinimalHighlightExtraction(exer, answer, commandContext);
+    } catch {
+      // 失败不影响主流程，仅回落到规则词典
+    }
+  }
+
+  /**
+   * 轻量抽取：只让模型输出考点词（不带分析、不剧透答案），格式严格为【高亮】...
+   * 用于主回答未返回【高亮】时的兜底。
+   */
+  private async doMinimalHighlightExtraction(
+    exer: import('./types.js').ExerciseItem,
+    lastAnswer: string,
+    commandContext: PiCommandContext
+  ): Promise<void> {
+    // 构建一个最小化 prompt：包含题目上下文 + 要求只输出高亮块
+    const context = `【当前题目】${exer.title}\n${
+      exer.a ? `A. ${exer.a}\n` : ''
+    }${exer.b ? `B. ${exer.b}\n` : ''}${exer.c ? `C. ${exer.c}\n` : ''}${
+      exer.d ? `D. ${exer.d}\n` : ''
+    }\n请只输出一行高亮标注，格式为：【高亮】题眼:<词>;易错:<词>;结论:<词>\n不要输出任何其他文字或解释。`;
+
+    const registry = commandContext.modelRegistry as
+      | { complete(model: unknown, context: unknown): Promise<{ content?: Array<{ type: string; text?: string }>; errorMessage?: string }> }
+      | undefined;
+    const model = commandContext.model;
+    if (!registry || !model) return;
+
+    try {
+      const message = await registry.complete(model, {
+        systemPrompt: '你只负责提取本题的考点词，不要分析、不要剧透答案、不要任何解释。',
+        messages: [{ role: 'user', content: context, timestamp: Date.now() }],
+      }) as { content?: Array<{ type: string; text?: string }>; errorMessage?: string };
+      if (message?.errorMessage) return;
+      const text = (message?.content || [])
+        .filter((block) => block.type === 'text' && block.text)
+        .map((block) => block.text)
+        .join('')
+        .trim();
+      const terms = parseHighlightBlock(text);
+      if (terms.length) exer.llmMarks = terms;
+    } catch {
+      // 忽略异常，不影响主流程
+    }
   }
 
   private async runTui(tui: ExerciseTUI, commandContext?: PiCommandContext): Promise<void> {
