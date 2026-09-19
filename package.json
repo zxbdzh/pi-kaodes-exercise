@@ -1,0 +1,30 @@
+{
+  "name": "pi-kaodes-exercise",
+  "version": "1.0.0",
+  "description": "Pi 终端交互式刷题插件 - 支持 kaodes.com 全模块题库与 AI 反问闪卡伴学",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "pi": {
+    "extensions": ["./dist/index.js"]
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "node --test dist/**/*.test.js",
+    "pretest": "tsc"
+  },
+  "keywords": [
+    "pi",
+    "extension",
+    "kaodes",
+    "exercise",
+    "tui",
+    "ai-tutor"
+  ],
+  "author": "Codex",
+  "license": "MIT",
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.3.3"
+  }
+}
