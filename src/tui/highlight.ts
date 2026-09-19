@@ -100,3 +100,99 @@ export function commonPrefixLength(texts: string[]): number {
   if (minRest < 2) return 0;
   return lcp.length;
 }
+
+/** LLM 抽取出的一个高亮词及其语义类型（可序列化，缓存进 session）。 */
+export interface HighlightTerm {
+  term: string;
+  kind: HighlightKind;
+}
+
+/**
+ * 把 LLM 给出的高亮词映射为纯文本上的偏移区间。
+ * 只信任词面本身（用 indexOf 定位），不采用模型返回的数字偏移——后者不可靠。
+ */
+export function marksFromTerms(text: string, terms: HighlightTerm[] | undefined): Mark[] {
+  if (!text || !terms?.length) return [];
+  const raw: Mark[] = [];
+  for (const { term, kind } of terms) {
+    if (!term) continue;
+    let from = 0;
+    for (;;) {
+      const start = text.indexOf(term, from);
+      if (start < 0) break;
+      raw.push({ start, end: start + term.length, kind });
+      from = start + term.length;
+    }
+  }
+  return dedupe(raw);
+}
+
+/** 按起点排序、长词优先，重叠时保留先出现者。 */
+function dedupe(raw: Mark[]): Mark[] {
+  raw.sort((a, b) => a.start - b.start || (b.end - b.start) - (a.end - a.start));
+  const merged: Mark[] = [];
+  let lastEnd = -1;
+  for (const mark of raw) {
+    if (mark.start < lastEnd) continue;
+    merged.push(mark);
+    lastEnd = mark.end;
+  }
+  return merged;
+}
+
+/**
+ * 合并规则高亮与 LLM 高亮：重叠处以 LLM 为准（更懂语义），其余取并集。
+ */
+export function mergeMarks(ruleMarks: Mark[], llmMarks: Mark[]): Mark[] {
+  if (!llmMarks.length) return ruleMarks;
+  if (!ruleMarks.length) return llmMarks;
+  const keptRule = ruleMarks.filter(
+    (r) => !llmMarks.some((l) => r.start < l.end && l.start < r.end)
+  );
+  return dedupe([...keptRule, ...llmMarks]);
+}
+
+const LABEL_KIND: Array<[RegExp, HighlightKind]> = [
+  [/题眼|关键|考点|重点/, 'key'],
+  [/易错|否定|陷阱|错误|设问/, 'warn'],
+  [/结论|落点|答案|因此/, 'concl'],
+];
+
+function kindOfLabel(label: string): HighlightKind | undefined {
+  for (const [re, kind] of LABEL_KIND) {
+    if (re.test(label)) return kind;
+  }
+  return undefined;
+}
+
+/**
+ * 从 AI 回答原文里解析【高亮】块。约定格式（单行、分号分段、冒号分隔标签与词）：
+ *   【高亮】题眼:根本保证,党的领导;易错:错误的是;结论:由此可见
+ * 解析失败或没有该块时返回空数组，不影响主流程。
+ */
+export function parseHighlightBlock(answer: string): HighlightTerm[] {
+  if (!answer) return [];
+  const marker = '【高亮】';
+  const at = answer.indexOf(marker);
+  if (at < 0) return [];
+  let rest = answer.slice(at + marker.length);
+  // 遇到下一个【…】块（如【记忆卡】）即截断
+  const nextBlock = rest.indexOf('【');
+  if (nextBlock >= 0) rest = rest.slice(0, nextBlock);
+
+  const out: HighlightTerm[] = [];
+  const segments = rest.split(/[;；\n]/);
+  for (const seg of segments) {
+    const m = seg.split(/[:：]/);
+    if (m.length < 2) continue;
+    const kind = kindOfLabel(m[0].trim());
+    if (!kind) continue;
+    const terms = m.slice(1).join(':').split(/[,，、\s]+/);
+    for (const raw of terms) {
+      const term = raw.trim();
+      // 过滤空串、单字噪声与整句（>12 字），只保留可用的考点词
+      if (term.length >= 2 && term.length <= 12) out.push({ term, kind });
+    }
+  }
+  return out;
+}

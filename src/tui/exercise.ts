@@ -1,6 +1,6 @@
 import readline from 'node:readline';
 import { parseKeyName } from './keys.js';
-import { commonPrefixLength, findMarks, markAnsi, DIM_ANSI, RESET_ANSI, Mark } from './highlight.js';
+import { commonPrefixLength, findMarks, marksFromTerms, mergeMarks, markAnsi, DIM_ANSI, RESET_ANSI, Mark } from './highlight.js';
 import { ExerciseItem, PracticeSession } from '../types.js';
 import { KaodesClient } from '../api/client.js';
 import { SessionCache } from '../cache/session.js';
@@ -108,6 +108,7 @@ export const KAODES_HELP = [
   '规则高亮配色:',
   '  题眼定位词（根本/本质/关键…）= 黄 · 否定设问（错误的是/不属于…）= 红',
   '  解析结论词（因此/由此可见…）= 绿 · 选项公共前缀 = 灰（只留差异）',
+  '  按 T 点拨 / F 问 AI 后，AI 会顺带标出本题考点（LLM 高亮，缓存本题、离线可复现）',
   '',
   '底栏说明:',
   '  session 行紧凑展示进度 · 章节 · 科目；执行中 / 成功 / 错误等临时状态',
@@ -354,8 +355,12 @@ export class ExerciseTUI {
   }> {
     const cur = this.session.exercises[this.session.currentIndex];
     if (!cur) return [{ text: '暂无题目', color: 'muted' }];
-    const marksOf = (text: string): Mark[] | undefined =>
-      this.highlightEnabled && text ? findMarks(text) : undefined;
+    // 规则高亮打底，叠加当前题缓存的 LLM 高亮词（AI 回答时产出），重叠处以 LLM 为准。
+    const marksOf = (text: string): Mark[] | undefined => {
+      if (!this.highlightEnabled || !text) return undefined;
+      const merged = mergeMarks(findMarks(text), marksFromTerms(text, cur.llmMarks));
+      return merged.length ? merged : undefined;
+    };
 
     const stemText = `${cur.keyType || '选择题'}  ${cur.title}`;
     const lines: Array<{ text: string; color: string; marks?: Mark[]; dim?: { start: number; end: number } }> = [

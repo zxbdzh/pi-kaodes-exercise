@@ -1,6 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { commonPrefixLength, findMarks, markColor } from './highlight.js';
+import {
+  commonPrefixLength,
+  findMarks,
+  markColor,
+  marksFromTerms,
+  mergeMarks,
+  parseHighlightBlock,
+} from './highlight.js';
 
 test('findMarks - 题眼定位词标为 key', () => {
   const marks = findMarks('全面建设社会主义现代化国家，根本保证是坚持党的领导');
@@ -40,3 +47,45 @@ test('commonPrefixLength - 阈值与余量保护', () => {
   assert.equal(commonPrefixLength(['只有一条有字']), 0);
   assert.equal(commonPrefixLength([]), 0);
 });
+
+test('parseHighlightBlock - 解析【高亮】块并映射语义类型', () => {
+  const answer =
+    '这道题考查党的领导。\n【记忆卡】\n【问】根本保证是什么？\n【要点】党的领导。\n' +
+    '【高亮】题眼:根本保证,党的领导;易错:错误的是;结论:由此可见';
+  const terms = parseHighlightBlock(answer);
+  assert.ok(terms.some((t) => t.term === '根本保证' && t.kind === 'key'));
+  assert.ok(terms.some((t) => t.term === '党的领导' && t.kind === 'key'));
+  assert.ok(terms.some((t) => t.term === '错误的是' && t.kind === 'warn'));
+  assert.ok(terms.some((t) => t.term === '由此可见' && t.kind === 'concl'));
+});
+
+test('parseHighlightBlock - 无块/过滤噪声词', () => {
+  assert.deepEqual(parseHighlightBlock('普通回答，没有高亮块'), []);
+  // 单字与超长句被过滤
+  const terms = parseHighlightBlock('【高亮】题眼:党,这是一个非常长的整句超过十二个字符');
+  assert.deepEqual(terms, []);
+});
+
+test('marksFromTerms - 词面定位偏移，忽略不存在的词', () => {
+  const marks = marksFromTerms('坚持党的领导是根本保证', [
+    { term: '党的领导', kind: 'key' },
+    { term: '不存在词', kind: 'warn' },
+  ]);
+  assert.equal(marks.length, 1);
+  assert.equal(marks[0].start, 2);
+  assert.equal(marks[0].end, 6);
+  assert.equal(marks[0].kind, 'key');
+  assert.deepEqual(marksFromTerms('任意', undefined), []);
+});
+
+test('mergeMarks - 重叠处以 LLM 为准，其余取并集', () => {
+  const rule = findMarks('根本在于坚持党的领导'); // 规则命中「根本」
+  const llm = marksFromTerms('根本在于坚持党的领导', [{ term: '根本在于', kind: 'concl' }]);
+  const merged = mergeMarks(rule, llm);
+  // LLM 的「根本在于」覆盖了规则「根本」，不再单独出现 key 的根本
+  assert.ok(merged.some((m) => m.kind === 'concl' && m.start === 0 && m.end === 4));
+  assert.ok(!merged.some((m) => m.kind === 'key' && m.start === 0 && m.end === 2));
+  // 无 LLM 时原样返回规则结果
+  assert.deepEqual(mergeMarks(rule, []), rule);
+});
+

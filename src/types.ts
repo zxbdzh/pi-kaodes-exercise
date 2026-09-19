@@ -44,6 +44,11 @@ export interface ExerciseItem {
   viewAnswer?: number;
   starCount?: number;
   source?: string;
+  /**
+   * LLM 抽取的高亮词（第二阶段）：AI 回答当前题时顺带产出，缓存进 session。
+   * 渲染时映射为偏移区间并与规则高亮合并；离线/未调用时为空，自动回落规则高亮。
+   */
+  llmMarks?: Array<{ term: string; kind: 'key' | 'warn' | 'concl' }>;
 }
 
 export interface ChapterPracticeNode {

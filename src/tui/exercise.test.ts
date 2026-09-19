@@ -373,3 +373,44 @@ test('ExerciseTUI - 规则高亮：行内分段着色与 :hl 开关', async () =
   });
   if (fs.existsSync(tmpCacheDir)) fs.rmSync(tmpCacheDir, { recursive: true });
 });
+
+test('ExerciseTUI - LLM 高亮：AI 抽取的词叠加渲染（规则未覆盖也能标出）', async () => {
+  const tmpCacheDir = path.join(os.tmpdir(), `test-llmhl-${Date.now()}`);
+  const cache = new SessionCache(tmpCacheDir);
+  const session = makeMockSession();
+  // 「题目一」不含任何规则词典词；LLM 抽取后应被单独标黄
+  session.exercises[0].llmMarks = [{ term: '题目一', kind: 'key' }];
+  const tui = new ExerciseTUI(session, new KaodesClient(new AuthManager()), cache);
+
+  const KEY_ANSI = '\x1b[33m';
+  const RESET = '\x1b[0m';
+  let component: { render(width: number): string[]; handleInput?(data: string): void } | undefined;
+
+  await tui.startInPi({
+    custom: async <T>(factory: any): Promise<T> => {
+      await new Promise<void>((resolve) => {
+        component = factory({ requestRender() {} }, undefined, {}, () => resolve());
+        const joined = component!.render(80).join('\n');
+        assert.ok(
+          joined.includes(`${KEY_ANSI}题目一${RESET}`),
+          `LLM 词应被标黄: ${JSON.stringify(joined)}`
+        );
+
+        // :hl off 后 LLM 高亮也一并关闭
+        component!.handleInput?.(':');
+        for (const ch of 'hl off') component!.handleInput?.(ch);
+        component!.handleInput?.('\r');
+        const off = component!.render(80).join('\n');
+        assert.ok(!off.includes(`${KEY_ANSI}题目一`), ':hl off 应同时关闭 LLM 高亮');
+
+        component!.handleInput?.(':');
+        for (const ch of 'exit discard') component!.handleInput?.(ch);
+        component!.handleInput?.('\r');
+      });
+      return undefined as T;
+    },
+    input: async () => undefined,
+    notify: () => undefined,
+  });
+  if (fs.existsSync(tmpCacheDir)) fs.rmSync(tmpCacheDir, { recursive: true });
+});

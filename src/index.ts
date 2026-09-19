@@ -4,12 +4,13 @@ import { SessionCache } from './cache/session.js';
 import { Preferences } from './config/preferences.js';
 import { buildStatsReport } from './stats/report.js';
 import { ExerciseTUI, KAODES_HELP } from './tui/exercise.js';
+import { parseHighlightBlock } from './tui/highlight.js';
 import { PAGED_SELECT_BACK, pagedSelect } from './tui/pagedSelect.js';
 import { AiTutorEngine } from './tutor/engine.js';
 import { ChapterPracticeNode, PracticeSession } from './types.js';
 
 /** 插件版本号，需与 package.json 的 version 保持一致。 */
-export const PLUGIN_VERSION = '1.1.0';
+export const PLUGIN_VERSION = '1.2.0';
 
 /** 当前加载的构建目录（dist 绝对路径），用于让用户确认加载的是新构建。 */
 function loadedBuildDir(): string {
@@ -20,6 +21,20 @@ function loadedBuildDir(): string {
   } catch {
     return '(未知)';
   }
+}
+
+/**
+ * 去掉 AI 回答末尾的【高亮】机器标注块（只保留给人看的内容与【记忆卡】）。
+ * 高亮块约定在回答最末尾；若其后还有其它【…】块则予以保留。
+ */
+function stripHighlightBlock(text: string): string {
+  const marker = '【高亮】';
+  const at = text.indexOf(marker);
+  if (at < 0) return text;
+  const rest = text.slice(at + marker.length);
+  const next = rest.indexOf('【');
+  const tail = next >= 0 ? rest.slice(next) : '';
+  return (text.slice(0, at) + tail).replace(/\s+$/, '');
 }
 
 export interface PiComponent {
@@ -517,7 +532,10 @@ export class KaodesExtension {
       const message = (await registry.complete(model, {
         systemPrompt:
           '你是备考伴学导师。回答学员关于当前题目的问题，简练准确。' +
-          '若回答的知识点值得记忆，在回答末尾追加一张记忆卡，格式严格为：\n【记忆卡】\n【问】<一句话反问>\n【要点】<1-3 句要点>\n若不值得记忆则不加记忆卡。',
+          '若回答的知识点值得记忆，在回答末尾追加一张记忆卡，格式严格为：\n【记忆卡】\n【问】<一句话反问>\n【要点】<1-3 句要点>\n若不值得记忆则不加记忆卡。\n' +
+          '另外，请在回答最末尾追加一行高亮标注，用于在题干/选项上标出考点，格式严格为：\n' +
+          '【高亮】题眼:<考点词,逗号分隔>;易错:<否定或陷阱词>;结论:<结论落点词>\n' +
+          '只填当前题目原文里确实出现的词，每类可留空，词长 2-12 字，不要编造。',
         messages: [{ role: 'user', content: prompt, timestamp: Date.now() }],
       })) as { content?: Array<{ type: string; text?: string }>; errorMessage?: string };
       if (message?.errorMessage) return null;
@@ -534,6 +552,7 @@ export class KaodesExtension {
 
   /**
    * 快速问 AI：输入问题 → LLM 回答；回答含【记忆卡】时提示按 C 查看。
+   * AI 回答里若带【高亮】块，则顺带把考点词缓存到当前题（第二阶段 LLM 高亮，零额外调用）。
    */
   private async tutorInPi(
     exer: import('./types.js').ExerciseItem,
@@ -542,7 +561,9 @@ export class KaodesExtension {
   ): Promise<void> {
     if (mode === 'hint') {
       // 一键点拨：直接让 AI 分析当前题（不剧透答案）
-      const hint = await this.askPiLLM(commandContext, this.tutor.buildHintPrompt(exer));
+      const raw = await this.askPiLLM(commandContext, this.tutor.buildHintPrompt(exer));
+      this.applyLlmHighlight(exer, raw);
+      const hint = raw ? stripHighlightBlock(raw) : null;
       commandContext.ui.notify(hint || this.tutor.generateFallbackHint(exer), 'info');
       return;
     }
@@ -560,16 +581,25 @@ export class KaodesExtension {
       exer.d ? `D. ${exer.d}\n` : ''
     }${exer.userKey ? `【我的作答】${exer.userKey}\n` : ''}\n【我的问题】${question.trim()}`;
 
-    const answer = await this.askPiLLM(commandContext, context);
-    if (!answer) {
+    const raw = await this.askPiLLM(commandContext, context);
+    if (!raw) {
       commandContext.ui.notify('AI 暂不可用（无可用模型或调用失败），可稍后重试。', 'warning');
       return;
     }
+    this.applyLlmHighlight(exer, raw);
+    const answer = stripHighlightBlock(raw);
     this.lastAiAnswer = answer;
     commandContext.ui.notify(answer, 'info');
     if (answer.includes('【记忆卡】')) {
       commandContext.ui.notify('AI 为你生成了一张记忆卡，按 C 键查看。', 'success');
     }
+  }
+
+  /** 从 AI 回答解析【高亮】词并缓存到当前题；无该块则保持既有高亮不变。 */
+  private applyLlmHighlight(exer: import('./types.js').ExerciseItem, answer: string | null): void {
+    if (!answer) return;
+    const terms = parseHighlightBlock(answer);
+    if (terms.length) exer.llmMarks = terms;
   }
 
   private async runTui(tui: ExerciseTUI, commandContext?: PiCommandContext): Promise<void> {
