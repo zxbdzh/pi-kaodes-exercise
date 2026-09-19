@@ -109,30 +109,71 @@ export class KaodesClient {
       }
     }
 
-    const res = await fetch(url, {
+    const res = await this.fetchWithRetry(url, {
       method: options.method || 'GET',
       headers,
       body: reqBody,
-    });
+    }, endpoint);
 
     if (res.status === 401) {
       // Token 过期失效
       console.warn('\n[Kaodes] 401 未授权，请更新 Token。');
       const newToken = await this.authManager.promptForToken();
       headers.token = newToken;
-      const retryRes = await fetch(url, {
+      const retryRes = await this.fetchWithRetry(url, {
         method: options.method || 'GET',
         headers,
         body: reqBody,
-      });
+      }, endpoint);
       return this.parseResponse<T>(retryRes, endpoint);
     }
 
     return this.parseResponse<T>(res, endpoint);
   }
 
+  /**
+   * 带重试的 fetch：对网络异常与 5xx 做指数退避重试（默认最多 3 次尝试）。
+   * 4xx（含 401）属于确定性错误，不重试，交由上层处理。
+   */
+  private async fetchWithRetry(
+    url: string,
+    init: RequestInit,
+    endpoint: string,
+    maxAttempts = 3
+  ): Promise<Response> {
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        const res = await fetch(url, init);
+        if (res.status >= 500 && attempt < maxAttempts) {
+          await this.delay(attempt * 300);
+          continue;
+        }
+        return res;
+      } catch (error) {
+        lastError = error;
+        if (attempt < maxAttempts) {
+          await this.delay(attempt * 300);
+          continue;
+        }
+      }
+    }
+    const reason = lastError instanceof Error ? lastError.message : String(lastError);
+    throw new Error(`${endpoint}: 网络请求失败（已重试 ${maxAttempts} 次）：${reason}`);
+  }
+
+  private delay(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
   private async parseResponse<T>(res: Response, endpoint: string): Promise<ApiResponse<T>> {
-    const payload = (await res.json()) as ApiResponse<T>;
+    let payload: ApiResponse<T>;
+    try {
+      payload = (await res.json()) as ApiResponse<T>;
+    } catch {
+      // 非 JSON 响应（如网关 HTML 错误页）：给出可读的状态信息而非裸解析异常
+      throw new Error(`${endpoint}: HTTP ${res.status}，返回内容不是有效 JSON（服务异常或被拦截）`);
+    }
     if (!res.ok) {
       throw new Error(`${endpoint}: HTTP ${res.status}${payload?.message ? `，${payload.message}` : ''}`);
     }

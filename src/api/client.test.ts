@@ -118,3 +118,64 @@ test('KaodesClient - 接口封装与请求格式验证', async () => {
 
   await new Promise<void>((resolve) => server.close(() => resolve()));
 });
+
+function makeRetryClient(): KaodesClient {
+  const fakeAuth = { ensureValidToken: async () => 'test-token' } as unknown as AuthManager;
+  return new KaodesClient(fakeAuth, 'https://example.test/mobile/');
+}
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+test('KaodesClient - 网络异常自动重试后成功', async () => {
+  const client = makeRetryClient();
+  let calls = 0;
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    calls++;
+    if (calls < 3) throw new Error('ECONNRESET');
+    return jsonResponse({ code: 200, flag: true, message: 'ok', data: { list: [{ productId: 1, name: '科目' }] } });
+  }) as typeof fetch;
+
+  try {
+    const products = await client.getUserProductList();
+    assert.equal(calls, 3, '应在第 3 次尝试成功');
+    assert.equal(products.length, 1);
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test('KaodesClient - 持续失败时抛出可读的网络错误', async () => {
+  const client = makeRetryClient();
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    throw new Error('timeout');
+  }) as typeof fetch;
+
+  try {
+    await assert.rejects(() => client.getUserProductList(), /网络请求失败（已重试 3 次）/);
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test('KaodesClient - 非 JSON 响应给出可读错误而非裸解析异常', async () => {
+  const client = makeRetryClient();
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response('<html>502 Bad Gateway</html>', {
+      status: 200,
+      headers: { 'Content-Type': 'text/html' },
+    })) as typeof fetch;
+
+  try {
+    await assert.rejects(() => client.getUserProductList(), /不是有效 JSON/);
+  } finally {
+    globalThis.fetch = original;
+  }
+});

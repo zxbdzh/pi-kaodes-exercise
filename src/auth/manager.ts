@@ -138,7 +138,11 @@ export class AuthManager {
    * 交互式提示用户输入 Token（独立 CLI 模式使用）
    */
   public async promptForToken(promptMessage?: string): Promise<string> {
-    const msg = promptMessage || '\n[Kaodes] 请输入 kaodes.com 的 Token 或完整 Cookie (输入后回车): ';
+    const msg =
+      promptMessage ||
+      '\n[Kaodes] 请输入 kaodes.com 的 Token 或完整 Cookie (输入后回车):\n' +
+      '  获取方式：浏览器登录 kaodes.com → F12 打开开发者工具 → Network 任一接口\n' +
+      '  → 复制请求头里的 token（或整段 Cookie）粘贴到这里即可。\n';
 
     if (this.promptProvider) {
       const rawInput = await this.promptProvider(msg);

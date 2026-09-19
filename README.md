@@ -84,6 +84,10 @@ Kaodes 接口实际使用的是原始 `token` Header 和 `platform: Pc`，不是
 | `/kaodes exam` | 启动全真模拟考试 |
 | `/kaodes challenge` | 启动答题闯关挑战 |
 | `/kaodes login` | 手动输入并更新登录凭证 Token |
+| `/kaodes stats` | 学习统计看板：覆盖章节、题量、正确率、按科目聚合 |
+| `/kaodes prefs` | 查看当前偏好（规则高亮开关、分页每页条数） |
+| `/kaodes version` | 显示插件版本号与当前加载的构建目录（排查是否加载了新构建） |
+| `/kaodes help` | 查看完整帮助（模式 / 快捷键 / 答题页指令） |
 
 ---
 
