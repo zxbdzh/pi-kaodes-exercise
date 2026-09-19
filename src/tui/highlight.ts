@@ -26,12 +26,27 @@ const WARN_WORDS = ['错误的是', '错误的有', '不正确', '不属于', '�
 /** 解析结论词：答案与解析里的落点句。 */
 const CONCL_WORDS = ['由此可见', '因此', '所以', '可见', '这表明', '这说明', '启示是', '启示在于'];
 
-/** kind → 主题色名（交给宿主 theme.fg 解析，fallback 走基础 ANSI）。 */
+/** kind → 主题色名（保留给宿主主题解析，作为可选降级）。 */
 export function markColor(kind: HighlightKind): string {
   if (kind === 'key') return 'yellow';
   if (kind === 'warn') return 'red';
   return 'green';
 }
+
+/**
+ * kind → 固定 ANSI 前景序列。高亮直接用这套硬编码序列，不经过宿主 theme.fg，
+ * 避免某些终端主题把 yellow/red/green 解析成与底色几乎一致的颜色而“看不见”。
+ */
+export function markAnsi(kind: HighlightKind): string {
+  if (kind === 'key') return '\x1b[33m'; // 黄
+  if (kind === 'warn') return '\x1b[31m'; // 红
+  return '\x1b[32m'; // 绿
+}
+
+/** 选项公共前缀弱化用的固定 ANSI（dim）。 */
+export const DIM_ANSI = '\x1b[2m';
+/** 固定 ANSI 复位序列。 */
+export const RESET_ANSI = '\x1b[0m';
 
 function collect(text: string, words: string[], kind: HighlightKind, out: Mark[]): void {
   for (const word of words) {

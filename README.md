@@ -40,6 +40,19 @@ pi --extension F:/github/pi-kaodes-exercise/dist/index.js
 
 也可以在 Pi 启动后通过本地扩展安装机制加载项目目录；为了避免加载到旧的 `dist`，每次改源码后先执行 `npm run build`。
 
+> **确认加载的是新构建**：进入 Pi 后执行 `/kaodes version`，会显示插件版本号与当前加载的 `dist` 构建目录。
+> 若功能表现与文档不符（例如高亮看不见、翻页无效），多半是加载了旧构建：重新 `npm run build`，或用 `pi --extension F:/github/pi-kaodes-exercise/dist/index.js` 直接指向最新产物再启动。
+
+### 2.1 更新到新版本
+```bash
+cd F:/github/pi-kaodes-exercise
+git pull
+npm install
+npm run build
+# 若通过 Pi 本地扩展安装机制加载，请重新安装/刷新扩展，使其指向新的 dist
+```
+更新后再次运行 `/kaodes version` 核对版本号即可。
+
 ### 3. 配置与更新 Token
 
 进入 Pi 后输入：

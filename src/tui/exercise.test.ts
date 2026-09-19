@@ -328,30 +328,38 @@ test('ExerciseTUI - 规则高亮：行内分段着色与 :hl 开关', async () =
       await new Promise<void>((resolve) => {
         const component = factory({ requestRender() {} }, theme, {}, () => resolve());
 
+        // 高亮标记走固定 ANSI（不依赖宿主 theme.fg），因此断言直接看渲染行原文。
+        const KEY_ANSI = '\x1b[33m';
+        const WARN_ANSI = '\x1b[31m';
+        const CONCL_ANSI = '\x1b[32m';
+        const DIM_ANSI = '\x1b[2m';
+        const RESET = '\x1b[0m';
+
         painted.length = 0;
-        component.render(80);
-        assert.ok(painted.includes('yellow|关键'), `题干题眼应为黄: ${painted.join(' / ')}`);
-        assert.ok(painted.includes('red|错误的是'), `否定设问应为红: ${painted.join(' / ')}`);
-        assert.ok(painted.includes('muted|坚持党的'), '选项公共前缀应弱化');
-        assert.ok(painted.includes('accent|→ A. '), '光标行选项字母不应被弱化');
-        assert.ok(!painted.some((p) => p.startsWith('green|')), '解析未展开时不应出现结论着色');
+        let joined = component.render(80).join('\n');
+        assert.ok(joined.includes(`${KEY_ANSI}关键${RESET}`), `题干题眼应为固定黄 ANSI: ${JSON.stringify(joined)}`);
+        assert.ok(joined.includes(`${WARN_ANSI}错误的是${RESET}`), `否定设问应为固定红 ANSI: ${JSON.stringify(joined)}`);
+        assert.ok(joined.includes(`${DIM_ANSI}坚持党的${RESET}`), '选项公共前缀应弱化(dim ANSI)');
+        // 光标行选项字母仍走宿主主题着色，不应被弱化
+        assert.ok(painted.includes('accent|→ A. '), `光标行选项字母不应被弱化: ${painted.join(' / ')}`);
+        assert.ok(!joined.includes(`${CONCL_ANSI}由此可见`), '解析未展开时不应出现结论着色');
 
         component.handleInput?.('v'); // 展开答案与解析
         painted.length = 0;
-        component.render(80);
-        assert.ok(painted.includes('green|由此可见'), '解析结论词应为绿');
+        joined = component.render(80).join('\n');
+        assert.ok(joined.includes(`${CONCL_ANSI}由此可见${RESET}`), '解析结论词应为固定绿 ANSI');
 
         component.handleInput?.(':');
         for (const ch of 'hl off') component.handleInput?.(ch);
         component.handleInput?.('\r');
         painted.length = 0;
-        component.render(80);
+        joined = component.render(80).join('\n');
         assert.ok(
-          !painted.includes('yellow|关键') &&
-            !painted.includes('red|错误的是') &&
-            !painted.includes('green|由此可见') &&
-            !painted.includes('muted|坚持党的'),
-          `:hl off 后应无任何规则着色: ${painted.join(' / ')}`
+          !joined.includes(`${KEY_ANSI}关键`) &&
+            !joined.includes(`${WARN_ANSI}错误的是`) &&
+            !joined.includes(`${CONCL_ANSI}由此可见`) &&
+            !joined.includes(`${DIM_ANSI}坚持党的`),
+          `:hl off 后应无任何规则着色: ${JSON.stringify(joined)}`
         );
 
         component.handleInput?.(':');

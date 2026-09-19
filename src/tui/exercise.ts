@@ -1,6 +1,6 @@
 import readline from 'node:readline';
 import { parseKeyName } from './keys.js';
-import { commonPrefixLength, findMarks, markColor, Mark } from './highlight.js';
+import { commonPrefixLength, findMarks, markAnsi, DIM_ANSI, RESET_ANSI, Mark } from './highlight.js';
 import { ExerciseItem, PracticeSession } from '../types.js';
 import { KaodesClient } from '../api/client.js';
 import { SessionCache } from '../cache/session.js';
@@ -64,6 +64,7 @@ export const KAODES_HELP = [
   '  /kaodes exam       全真模拟考试',
   '  /kaodes challenge  答题闯关',
   '  /kaodes login      更新 Token',
+  '  /kaodes version    显示插件版本与加载的构建目录',
   '  /kaodes help       本帮助',
   '',
   '选择列表（科目 / 课程 / 章节）:',
@@ -632,19 +633,26 @@ export class ExerciseTUI {
   ): string {
     if (!marks?.length && !dim) return paint(baseColor, chunk);
     const end = chunkStart + chunk.length;
-    const colorAt = (index: number): string => {
+    // 每个字符归入一个 run 标签：mark kind / dim / base。相邻同标签合并成一段。
+    const tagAt = (index: number): string => {
       const mark = marks?.find((m) => index >= m.start && index < m.end);
-      if (mark) return markColor(mark.kind);
-      if (dim && index >= dim.start && index < dim.end) return 'muted';
-      return baseColor;
+      if (mark) return `mark:${mark.kind}`;
+      if (dim && index >= dim.start && index < dim.end) return 'dim';
+      return 'base';
+    };
+    const paintRun = (tag: string, text: string): string => {
+      if (tag === 'base') return paint(baseColor, text);
+      if (tag === 'dim') return `${DIM_ANSI}${text}${RESET_ANSI}`;
+      const kind = tag.slice(5) as Mark['kind'];
+      return `${markAnsi(kind)}${text}${RESET_ANSI}`;
     };
     let out = '';
     let pos = chunkStart;
     while (pos < end) {
-      const color = colorAt(pos);
+      const tag = tagAt(pos);
       let next = pos;
-      while (next < end && colorAt(next) === color) next++;
-      out += paint(color, chunk.slice(pos - chunkStart, next - chunkStart));
+      while (next < end && tagAt(next) === tag) next++;
+      out += paintRun(tag, chunk.slice(pos - chunkStart, next - chunkStart));
       pos = next;
     }
     return out;

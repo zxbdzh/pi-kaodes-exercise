@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs';
-import { KaodesExtension } from './index.js';
+import { KaodesExtension, PLUGIN_VERSION } from './index.js';
 
 test('KaodesExtension - courseDetail 返回 null 时不应抛出 cstId 错误', async () => {
   const tmpConfig = path.join(os.tmpdir(), `test-null-detail-${Date.now()}.json`);
@@ -172,5 +172,23 @@ test('KaodesExtension - 插件初始化与命令注册验证', () => {
 
   assert.equal(registeredCommand, 'kaodes');
   assert.ok(registeredDesc.includes('考得尚全模块终端刷题插件'));
+});
+
+test('KaodesExtension - /kaodes version 报告版本号与构建目录', async () => {
+  const tmpConfig = path.join(os.tmpdir(), `test-version-${Date.now()}.json`);
+  const ext = new KaodesExtension({ configPath: tmpConfig });
+  const notifications: string[] = [];
+
+  await ext.handleCommand('version', {
+    ui: {
+      input: async () => undefined,
+      notify: (message: string) => notifications.push(message),
+      custom: async <T>() => undefined as T,
+    },
+  });
+
+  assert.equal(notifications.length, 1);
+  assert.ok(notifications[0].includes(`v${PLUGIN_VERSION}`), `应含版本号: ${notifications[0]}`);
+  assert.ok(notifications[0].includes('构建目录'), `应含构建目录: ${notifications[0]}`);
 });
 

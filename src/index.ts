@@ -6,6 +6,20 @@ import { PAGED_SELECT_BACK, pagedSelect } from './tui/pagedSelect.js';
 import { AiTutorEngine } from './tutor/engine.js';
 import { ChapterPracticeNode, PracticeSession } from './types.js';
 
+/** 插件版本号，需与 package.json 的 version 保持一致。 */
+export const PLUGIN_VERSION = '1.1.0';
+
+/** 当前加载的构建目录（dist 绝对路径），用于让用户确认加载的是新构建。 */
+function loadedBuildDir(): string {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const path = require('node:path') as typeof import('node:path');
+    return path.resolve(__dirname);
+  } catch {
+    return '(未知)';
+  }
+}
+
 export interface PiComponent {
   render(width: number): string[];
   handleInput?(data: string): void;
@@ -605,6 +619,13 @@ export class KaodesExtension {
       } else {
         console.log(`\n${KAODES_HELP}\n`);
       }
+      return;
+    }
+
+    if (sub === 'version' || sub === 'v' || sub === '--version' || sub === '-v') {
+      const line = `Kaodes 刷题插件 v${PLUGIN_VERSION} · 构建目录 ${loadedBuildDir()}`;
+      if (ctx?.ui.notify) ctx.ui.notify(line, 'info');
+      else console.log(`\n${line}\n`);
       return;
     }
 

@@ -1,12 +1,26 @@
 {
   "name": "pi-kaodes-exercise",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Pi 终端交互式刷题插件 - 支持 kaodes.com 全模块题库与 AI 反问闪卡伴学",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "pi": {
     "extensions": ["./dist/index.js"]
   },
+  "files": [
+    "dist",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zxbdzh/pi-kaodes-exercise.git"
+  },
+  "bugs": {
+    "url": "https://github.com/zxbdzh/pi-kaodes-exercise/issues"
+  },
+  "homepage": "https://github.com/zxbdzh/pi-kaodes-exercise#readme",
   "scripts": {
     "build": "tsc",
     "test": "node --test dist/**/*.test.js",
