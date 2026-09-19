@@ -1,5 +1,6 @@
 import readline from 'node:readline';
 import { parseKeyName } from './keys.js';
+import { commonPrefixLength, findMarks, markColor, Mark } from './highlight.js';
 import { ExerciseItem, PracticeSession } from '../types.js';
 import { KaodesClient } from '../api/client.js';
 import { SessionCache } from '../cache/session.js';
@@ -98,7 +99,12 @@ export const KAODES_HELP = [
   '  hint | t                AI 点拨',
   '  ask | f                 快速问 AI',
   '  card | c                查看记忆卡',
+  '  hl [on|off]             规则高亮开关',
   '  exit [save|discard]     退出（可指定保存 / 不保存）',
+  '',
+  '规则高亮配色:',
+  '  题眼定位词（根本/本质/关键…）= 黄 · 否定设问（错误的是/不属于…）= 红',
+  '  解析结论词（因此/由此可见…）= 绿 · 选项公共前缀 = 灰（只留差异）',
   '',
   '底栏说明:',
   '  session 行紧凑展示进度 · 章节 · 科目；执行中 / 成功 / 错误等临时状态',
@@ -199,6 +205,39 @@ function wrapPlain(value: string, width: number): string[] {
   return lines;
 }
 
+/** 与 wrapPlain 相同的换行规则，但返回每段在原串中的偏移区间。 */
+function wrapPlainWithOffsets(
+  value: string,
+  width: number
+): Array<{ text: string; start: number; end: number }> {
+  const out: Array<{ text: string; start: number; end: number }> = [];
+  if (width <= 0) return out;
+  let chunkStart = 0;
+  let used = 0;
+  let pos = 0;
+  const push = (from: number, to: number) => out.push({ text: value.slice(from, to), start: from, end: to });
+  for (const ch of value) {
+    const w = codePointWidth(ch.codePointAt(0) || 0);
+    if (used + w > width) {
+      if (pos > chunkStart) {
+        push(chunkStart, pos);
+        chunkStart = pos;
+        used = 0;
+      }
+      if (w > width) {
+        // 单字符已超宽（如 width=1 遇全角字）：与 wrapPlain 一致丢弃，保证不越界
+        pos += ch.length;
+        chunkStart = pos;
+        continue;
+      }
+    }
+    used += w;
+    pos += ch.length;
+  }
+  if (chunkStart < pos) push(chunkStart, pos);
+  return out;
+}
+
 /** 纯文本右侧补空格到指定可见宽度。 */
 function padPlain(value: string, width: number): string {
   const used = visibleWidth(value);
@@ -240,6 +279,8 @@ export class ExerciseTUI {
   private isRunning = false;
   /** 选项列表光标（上下键移动，Enter 确认），提问插件同款交互。 */
   private optionCursor = 0;
+  /** 规则高亮开关（:hl on|off），第一阶段仅本地词典。 */
+  private highlightEnabled = true;
   /** AI 记忆卡（从最近一次 AI 回答中提取，按 C 查看） */
   private memoryCard: MemoryCard | undefined;
   /** 记忆卡查看状态：正面 / 背面 */
@@ -297,12 +338,20 @@ export class ExerciseTUI {
    * 题目主体行（带颜色语义）：Pi 原生 select 同款分层 ——
    * 光标行 accent（青色）、普通内容 text、辅助信息 muted，供主区域着色渲染。
    */
-  private bodyLinesStyled(): Array<{ text: string; color: string }> {
+  private bodyLinesStyled(): Array<{
+    text: string;
+    color: string;
+    marks?: Mark[];
+    dim?: { start: number; end: number };
+  }> {
     const cur = this.session.exercises[this.session.currentIndex];
     if (!cur) return [{ text: '暂无题目', color: 'muted' }];
+    const marksOf = (text: string): Mark[] | undefined =>
+      this.highlightEnabled && text ? findMarks(text) : undefined;
 
-    const lines: Array<{ text: string; color: string }> = [
-      { text: `${cur.keyType || '选择题'}  ${cur.title}`, color: 'text' },
+    const stemText = `${cur.keyType || '选择题'}  ${cur.title}`;
+    const lines: Array<{ text: string; color: string; marks?: Mark[]; dim?: { start: number; end: number } }> = [
+      { text: stemText, color: 'text', marks: marksOf(stemText) },
       { text: '', color: 'text' },
     ];
 
@@ -317,12 +366,18 @@ export class ExerciseTUI {
 
     if (opts.length > 0) {
       const cursor = Math.min(this.optionCursor, opts.length - 1);
+      // 选项公共前缀弱化：只突出真正有区分度的差异部分（规则层，无 LLM）
+      const lcp = this.highlightEnabled ? commonPrefixLength(opts.map((o) => o.text!)) : 0;
       for (const [index, option] of opts.entries()) {
         // Pi 官方 select 同款：→ 指示光标行，其余行两空格缩进，Enter 确认
         const pointer = index === cursor ? '→' : ' ';
+        const text = `${pointer} ${option.key}. ${option.text}`;
+        const textStart = text.length - option.text!.length;
         lines.push({
-          text: `${pointer} ${option.key}. ${option.text}`,
+          text,
           color: index === cursor ? 'accent' : 'text',
+          marks: marksOf(text),
+          dim: lcp ? { start: textStart, end: textStart + lcp } : undefined,
         });
       }
     } else {
@@ -335,7 +390,10 @@ export class ExerciseTUI {
         text: `答案  ${cur.rightKey || (cur.rightKeyList ? cur.rightKeyList.join('') : '详见解析')}`,
         color: 'accent',
       });
-      if (cur.analyze) lines.push({ text: `解析  ${cur.analyze}`, color: 'text' });
+      if (cur.analyze) {
+        const analyzeText = `解析  ${cur.analyze}`;
+        lines.push({ text: analyzeText, color: 'text', marks: marksOf(analyzeText) });
+      }
     }
 
     return lines;
@@ -393,6 +451,16 @@ export class ExerciseTUI {
 
   public setOnAiTutor(callback: OnAiTutorCallback): void {
     this.onAiTutor = callback;
+  }
+
+  /** 规则高亮开关：on 开启 / off 关闭，返回当前状态。 */
+  public setHighlightEnabled(on: boolean): boolean {
+    this.highlightEnabled = on;
+    return this.highlightEnabled;
+  }
+
+  public getHighlightEnabled(): boolean {
+    return this.highlightEnabled;
   }
 
   public toggleAnswer(): void {
@@ -551,6 +619,38 @@ export class ExerciseTUI {
   }
 
   /**
+   * 行内分段着色：在已换行的纯文本片段上按 marks / dim 区间切 run 后逐段上色。
+   * 关键约束：先定宽截断、后包 ANSI，宽度计算永远只看纯文本。
+   */
+  private paintChunkWithMarks(
+    chunk: string,
+    chunkStart: number,
+    marks: Mark[] | undefined,
+    dim: { start: number; end: number } | undefined,
+    baseColor: string,
+    paint: ThemePainter
+  ): string {
+    if (!marks?.length && !dim) return paint(baseColor, chunk);
+    const end = chunkStart + chunk.length;
+    const colorAt = (index: number): string => {
+      const mark = marks?.find((m) => index >= m.start && index < m.end);
+      if (mark) return markColor(mark.kind);
+      if (dim && index >= dim.start && index < dim.end) return 'muted';
+      return baseColor;
+    };
+    let out = '';
+    let pos = chunkStart;
+    while (pos < end) {
+      const color = colorAt(pos);
+      let next = pos;
+      while (next < end && colorAt(next) === color) next++;
+      out += paint(color, chunk.slice(pos - chunkStart, next - chunkStart));
+      pos = next;
+    }
+    return out;
+  }
+
+  /**
    * 完整布局：边框题目区（提问插件同款视觉）+ 底栏 session/状态行 + 指令输入行。
    */
   private renderLayout(
@@ -571,18 +671,16 @@ export class ExerciseTUI {
       // Pi 原生编辑器同款：边框 borderMuted，内容按语义分层着色
       lines.push(paint('borderMuted', `╭${'─'.repeat(innerW)}╮`));
       for (const raw of this.bodyLinesStyled()) {
-        const wrapped = wrapPlain(raw.text, contentW);
+        const wrapped = wrapPlainWithOffsets(raw.text, contentW);
         if (wrapped.length === 0) {
           lines.push(paint('borderMuted', `│`) + ' ' + ' '.repeat(contentW) + ' ' + paint('borderMuted', `│`));
           continue;
         }
         for (const seg of wrapped) {
+          const styled = this.paintChunkWithMarks(seg.text, seg.start, raw.marks, raw.dim, raw.color, paint);
+          const pad = ' '.repeat(Math.max(0, contentW - visibleWidth(seg.text)));
           lines.push(
-            paint('borderMuted', `│`) +
-              ' ' +
-              paint(raw.color, padPlain(seg, contentW)) +
-              ' ' +
-              paint('borderMuted', `│`)
+            paint('borderMuted', `│`) + ' ' + styled + pad + ' ' + paint('borderMuted', `│`)
           );
         }
       }
@@ -590,9 +688,11 @@ export class ExerciseTUI {
     } else {
       // 极窄终端退化：无边框纯文本，保证不重叠、不越界。
       for (const raw of this.bodyLinesStyled()) {
-        const wrapped = wrapPlain(raw.text, safeWidth);
+        const wrapped = wrapPlainWithOffsets(raw.text, safeWidth);
         if (wrapped.length === 0) lines.push('');
-        for (const seg of wrapped) lines.push(paint(raw.color, seg));
+        for (const seg of wrapped) {
+          lines.push(this.paintChunkWithMarks(seg.text, seg.start, raw.marks, raw.dim, raw.color, paint));
+        }
       }
     }
 
@@ -802,6 +902,19 @@ export class ExerciseTUI {
             // 快速问 AI：与 F 键同路径
             const cur = this.session.exercises[this.session.currentIndex];
             if (cur && this.onAiTutor) void run(() => this.onAiTutor!(cur, 'flashcard'));
+            return;
+          }
+          case 'hl':
+          case 'highlight': {
+            // 规则高亮开关：题眼=黄 · 否定设问=红 · 解析结论=绿 · 选项公共前缀=灰
+            const next = !this.getHighlightEnabled();
+            const on = arg === 'on' ? true : arg === 'off' ? false : next;
+            if (arg && arg !== 'on' && arg !== 'off') {
+              setStatus('用法: hl [on|off]', 'error');
+              return;
+            }
+            this.setHighlightEnabled(on);
+            setStatus(`规则高亮已${on ? '开启' : '关闭'}`, 'success');
             return;
           }
           case 'card':

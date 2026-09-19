@@ -282,3 +282,86 @@ test('ExerciseTUI - 指令输入：输入/提交/取消/无效/跳题/退出全�
   assert.ok(KAODES_HELP.includes('goto') && KAODES_HELP.includes('exit'));
   if (fs.existsSync(tmpCacheDir)) fs.rmSync(tmpCacheDir, { recursive: true });
 });
+
+test('ExerciseTUI - 规则高亮：行内分段着色与 :hl 开关', async () => {
+  const tmpCacheDir = path.join(os.tmpdir(), `test-hl-${Date.now()}`);
+  const cache = new SessionCache(tmpCacheDir);
+  const session: PracticeSession = {
+    prId: 1,
+    scoringMethod: 1,
+    courseId: 'hl-course',
+    courseName: '高亮测试',
+    productId: 1,
+    cstId: 1,
+    catId: 'hl-cat',
+    chapterName: '高亮',
+    currentIndex: 0,
+    startTime: Date.now(),
+    runSecond: 0,
+    exercises: [
+      {
+        exerId: 1,
+        title: '全面推进强国建设，关键是党，错误的是哪一项',
+        keyType: '单选',
+        newKeyType: 1,
+        a: '坚持党的全面领导',
+        b: '坚持党的中心工作',
+        rightKey: 'A',
+        userKey: null,
+        doResult: 0,
+        analyze: '由此可见，根本在于坚持党的领导。',
+      },
+    ],
+  };
+  const tui = new ExerciseTUI(session, new KaodesClient(new AuthManager()), cache);
+
+  const painted: string[] = [];
+  const theme = {
+    fg: (color: string, text: string) => {
+      painted.push(`${color}|${text}`);
+      return `<${color}>${text}</>`;
+    },
+  };
+
+  await tui.startInPi({
+    custom: async <T>(factory: any): Promise<T> => {
+      await new Promise<void>((resolve) => {
+        const component = factory({ requestRender() {} }, theme, {}, () => resolve());
+
+        painted.length = 0;
+        component.render(80);
+        assert.ok(painted.includes('yellow|关键'), `题干题眼应为黄: ${painted.join(' / ')}`);
+        assert.ok(painted.includes('red|错误的是'), `否定设问应为红: ${painted.join(' / ')}`);
+        assert.ok(painted.includes('muted|坚持党的'), '选项公共前缀应弱化');
+        assert.ok(painted.includes('accent|→ A. '), '光标行选项字母不应被弱化');
+        assert.ok(!painted.some((p) => p.startsWith('green|')), '解析未展开时不应出现结论着色');
+
+        component.handleInput?.('v'); // 展开答案与解析
+        painted.length = 0;
+        component.render(80);
+        assert.ok(painted.includes('green|由此可见'), '解析结论词应为绿');
+
+        component.handleInput?.(':');
+        for (const ch of 'hl off') component.handleInput?.(ch);
+        component.handleInput?.('\r');
+        painted.length = 0;
+        component.render(80);
+        assert.ok(
+          !painted.includes('yellow|关键') &&
+            !painted.includes('red|错误的是') &&
+            !painted.includes('green|由此可见') &&
+            !painted.includes('muted|坚持党的'),
+          `:hl off 后应无任何规则着色: ${painted.join(' / ')}`
+        );
+
+        component.handleInput?.(':');
+        for (const ch of 'exit discard') component.handleInput?.(ch);
+        component.handleInput?.('\r');
+      });
+      return undefined as T;
+    },
+    input: async () => undefined,
+    notify: () => undefined,
+  });
+  if (fs.existsSync(tmpCacheDir)) fs.rmSync(tmpCacheDir, { recursive: true });
+});
