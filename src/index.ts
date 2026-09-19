@@ -1,6 +1,8 @@
 import { AuthManager } from './auth/manager.js';
 import { CourseListItem, KaodesClient, ProductItem } from './api/client.js';
 import { SessionCache } from './cache/session.js';
+import { Preferences } from './config/preferences.js';
+import { buildStatsReport } from './stats/report.js';
 import { ExerciseTUI, KAODES_HELP } from './tui/exercise.js';
 import { PAGED_SELECT_BACK, pagedSelect } from './tui/pagedSelect.js';
 import { AiTutorEngine } from './tutor/engine.js';
@@ -78,17 +80,38 @@ export class KaodesExtension {
   public client: KaodesClient;
   public cache: SessionCache;
   public tutor: AiTutorEngine;
+  /** 用户偏好（高亮开关 / 分页大小），持久化到 ~/.pi/kaodes-prefs.json。 */
+  public prefs: Preferences;
   /** Pi 宿主注入的 LLM 通道（initKaodesExtension 时透传） */
   public piModelRegistry?: PiCommandContext['modelRegistry'];
   public piModel?: unknown;
   /** 最近一次 AI 回答原文（供 TUI 提取记忆卡） */
   private lastAiAnswer?: string;
 
-  constructor(options?: { configPath?: string; cacheDir?: string }) {
+  constructor(options?: { configPath?: string; cacheDir?: string; prefsPath?: string }) {
     this.auth = new AuthManager(options?.configPath);
     this.client = new KaodesClient(this.auth);
     this.cache = new SessionCache(options?.cacheDir);
     this.tutor = new AiTutorEngine();
+    this.prefs = new Preferences(options?.prefsPath);
+  }
+
+  /**
+   * 统一的 TUI 工厂：注入 AI 伴学回调与用户偏好（初始高亮状态 + 变更持久化）。
+   */
+  private makeTui(session: PracticeSession): ExerciseTUI {
+    return new ExerciseTUI(
+      session,
+      this.client,
+      this.cache,
+      async (exer, mode) => {
+        await this.tutor.interact(exer, mode);
+      },
+      {
+        highlightEnabled: this.prefs.highlightEnabled,
+        onHighlightChange: (on) => this.prefs.setHighlightEnabled(on),
+      }
+    );
   }
 
   /**
@@ -108,7 +131,7 @@ export class KaodesExtension {
     const ui = commandContext?.ui;
     // 优先用自带分页选择器：长列表 ←/→ 翻页，⌫ 逐级返回
     if (ui?.custom) {
-      const picked = await pagedSelect(ui, { title, items, format, initialIndex: start, backEnabled: true });
+      const picked = await pagedSelect(ui, { title, items, format, initialIndex: start, backEnabled: true, pageSize: this.prefs.pageSize });
       if (picked === PAGED_SELECT_BACK) return 'back';
       return picked === undefined ? null : { item: picked };
     }
@@ -314,9 +337,7 @@ export class KaodesExtension {
       console.log(`[Kaodes] 恢复本地未完成断点进度 (当前第 ${session.currentIndex + 1} 题)...`);
     }
 
-    const tui = new ExerciseTUI(session, this.client, this.cache, async (exer, mode) => {
-      await this.tutor.interact(exer, mode);
-    });
+    const tui = this.makeTui(session);
 
     await this.runTui(tui, commandContext);
   }
@@ -357,9 +378,7 @@ export class KaodesExtension {
       runSecond: 0,
     };
 
-    const tui = new ExerciseTUI(session, this.client, this.cache, async (exer, mode) => {
-      await this.tutor.interact(exer, mode);
-    });
+    const tui = this.makeTui(session);
     await this.runTui(tui, commandContext);
   }
 
@@ -399,9 +418,7 @@ export class KaodesExtension {
       runSecond: 0,
     };
 
-    const tui = new ExerciseTUI(session, this.client, this.cache, async (exer, mode) => {
-      await this.tutor.interact(exer, mode);
-    });
+    const tui = this.makeTui(session);
     await this.runTui(tui, commandContext);
   }
 
@@ -445,9 +462,7 @@ export class KaodesExtension {
       runSecond: 0,
     };
 
-    const tui = new ExerciseTUI(session, this.client, this.cache, async (exer, mode) => {
-      await this.tutor.interact(exer, mode);
-    });
+    const tui = this.makeTui(session);
     await this.runTui(tui, commandContext);
   }
 
@@ -487,9 +502,7 @@ export class KaodesExtension {
       runSecond: 0,
     };
 
-    const tui = new ExerciseTUI(session, this.client, this.cache, async (exer, mode) => {
-      await this.tutor.interact(exer, mode);
-    });
+    const tui = this.makeTui(session);
     await this.runTui(tui, commandContext);
   }
 
@@ -626,6 +639,23 @@ export class KaodesExtension {
       const line = `Kaodes 刷题插件 v${PLUGIN_VERSION} · 构建目录 ${loadedBuildDir()}`;
       if (ctx?.ui.notify) ctx.ui.notify(line, 'info');
       else console.log(`\n${line}\n`);
+      return;
+    }
+
+    if (sub === 'prefs' || sub === 'config') {
+      const snap = this.prefs.snapshot();
+      const line =
+        `当前偏好：规则高亮 ${snap.highlightEnabled ? '开' : '关'} · 每页 ${snap.pageSize} 条\n` +
+        `（答题页 :hl on|off 切换高亮并自动保存；偏好文件 ~/.pi/kaodes-prefs.json）`;
+      if (ctx?.ui.notify) ctx.ui.notify(line, 'info');
+      else console.log(`\n${line}\n`);
+      return;
+    }
+
+    if (sub === 'stats' || sub === 'stat' || sub === 'report') {
+      const report = buildStatsReport(this.cache.listSessions());
+      if (ctx?.ui.notify) ctx.ui.notify(report, 'info');
+      else console.log(`\n${report}\n`);
       return;
     }
 

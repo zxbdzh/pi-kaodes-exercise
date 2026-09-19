@@ -65,6 +65,8 @@ export const KAODES_HELP = [
   '  /kaodes challenge  答题闯关',
   '  /kaodes login      更新 Token',
   '  /kaodes version    显示插件版本与加载的构建目录',
+  '  /kaodes prefs      查看当前偏好（高亮开关 / 每页条数）',
+  '  /kaodes stats      学习统计看板（进度 / 正确率 / 按科目）',
   '  /kaodes help       本帮助',
   '',
   '选择列表（科目 / 课程 / 章节）:',
@@ -282,6 +284,8 @@ export class ExerciseTUI {
   private optionCursor = 0;
   /** 规则高亮开关（:hl on|off），第一阶段仅本地词典。 */
   private highlightEnabled = true;
+  /** 高亮开关变化时的持久化回调（由宿主注入，写入用户偏好）。 */
+  private onHighlightChange?: (on: boolean) => void;
   /** AI 记忆卡（从最近一次 AI 回答中提取，按 C 查看） */
   private memoryCard: MemoryCard | undefined;
   /** 记忆卡查看状态：正面 / 背面 */
@@ -291,12 +295,15 @@ export class ExerciseTUI {
     session: PracticeSession,
     client: KaodesClient,
     cache: SessionCache,
-    onAiTutor?: OnAiTutorCallback
+    onAiTutor?: OnAiTutorCallback,
+    options?: { highlightEnabled?: boolean; onHighlightChange?: (on: boolean) => void }
   ) {
     this.session = session;
     this.client = client;
     this.cache = cache;
     this.onAiTutor = onAiTutor;
+    if (options?.highlightEnabled !== undefined) this.highlightEnabled = options.highlightEnabled;
+    this.onHighlightChange = options?.onHighlightChange;
   }
 
   /**
@@ -456,7 +463,9 @@ export class ExerciseTUI {
 
   /** 规则高亮开关：on 开启 / off 关闭，返回当前状态。 */
   public setHighlightEnabled(on: boolean): boolean {
+    const changed = this.highlightEnabled !== on;
     this.highlightEnabled = on;
+    if (changed) this.onHighlightChange?.(on);
     return this.highlightEnabled;
   }
 
