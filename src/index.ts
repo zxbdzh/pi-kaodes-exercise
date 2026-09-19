@@ -2,6 +2,7 @@ import { AuthManager } from './auth/manager.js';
 import { KaodesClient } from './api/client.js';
 import { SessionCache } from './cache/session.js';
 import { ExerciseTUI, KAODES_HELP } from './tui/exercise.js';
+import { pagedSelect } from './tui/pagedSelect.js';
 import { AiTutorEngine } from './tutor/engine.js';
 import { ChapterPracticeNode, PracticeSession } from './types.js';
 
@@ -84,12 +85,17 @@ export class KaodesExtension {
     fallbackIndex = 0
   ): Promise<T | null> {
     if (!items.length) return null;
-    if (!commandContext?.ui.select || items.length === 1) {
-      return items[fallbackIndex] || items[0];
+    if (items.length === 1) return items[fallbackIndex] || items[0];
+
+    const ui = commandContext?.ui;
+    // 优先用自带分页选择器：长章节列表可 ←/→ 翻页
+    if (ui?.custom) {
+      return (await pagedSelect(ui, { title, items, format })) ?? null;
     }
+    if (!ui?.select) return items[fallbackIndex] || items[0];
 
     const options = items.map((item, index) => `${index + 1}. ${format(item)}`);
-    const selected = await commandContext.ui.select(title, options);
+    const selected = await ui.select(title, options);
     if (!selected) return null;
     return items[options.indexOf(selected)] || null;
   }

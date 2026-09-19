@@ -1,5 +1,5 @@
 import readline from 'node:readline';
-import { appendFileSync } from 'node:fs';
+import { parseKeyName } from './keys.js';
 import { ExerciseItem, PracticeSession } from '../types.js';
 import { KaodesClient } from '../api/client.js';
 import { SessionCache } from '../cache/session.js';
@@ -64,6 +64,12 @@ export const KAODES_HELP = [
   '  /kaodes challenge  答题闯关',
   '  /kaodes login      更新 Token',
   '  /kaodes help       本帮助',
+  '',
+  '选择列表（科目 / 课程 / 章节）:',
+  '  ↑↓ 或 J / K    移动光标（跨页连续）',
+  '  ←→ 或 H / L    上一页 / 下一页',
+  '  Enter          确认选择',
+  '  Esc            取消',
   '',
   '答题页直接按键:',
   '  ↑/↓            移动选项光标',
@@ -476,28 +482,6 @@ export class ExerciseTUI {
     return response;
   }
 
-  private keyName(data: string): string {
-    if (data === '\r' || data === '\n') return 'enter';
-    // 标准方向键：\x1b[A/B/C/D
-    if (data === '\x1b[D') return 'left';
-    if (data === '\x1b[C') return 'right';
-    if (data === '\x1b[A') return 'up';
-    if (data === '\x1b[B') return 'down';
-    // Kitty 键盘协议 / modifyOtherKeys 扩展格式：\x1b[1;<mod>:<base>A 等，
-    // 实测某些终端（如用户环境）发 \x1b[1;1:1B —— 尾字母即方向，
-    // modifier 为 1（无修饰）时视作普通方向键。
-    const extArrow = /^\x1b\[1;\d+[:;]\d+([ABCD])$/.exec(data);
-    if (extArrow) {
-      const map: Record<string, string> = { A: 'up', B: 'down', C: 'right', D: 'left' };
-      return map[extArrow[1]];
-    }
-    // Kitty/modifyOtherKeys 的 Esc：\x1b[27u / \x1b[27;<mod>u
-    if (/^\x1b\[27(;\d+)?u$/.test(data)) return 'escape';
-    if (data === '\x1b') return 'escape';
-    if (data === '\x03') return 'ctrl+c';
-    return data.length === 1 ? data.toLowerCase() : data;
-  }
-
   /**
    * 记忆卡查看渲染（C 键触发）：正面问题 / 背面要点，Anki 式翻面。
    */
@@ -860,12 +844,8 @@ export class ExerciseTUI {
       return {
         render: (width: number) => this.renderLayout(width, { buffer, focused: inputFocused, status }, paint),
         handleInput: (data: string) => {
-          // 临时调试：记录到达组件的原始按键，定位无响应问题后移除
-          try {
-            appendFileSync('F:/github/pi-kaodes-exercise/debug-keys.log', `${Date.now()} raw=${JSON.stringify(data)} running=${this.isRunning} busy=${busy} inputFocused=${inputFocused}\n`);
-          } catch { /* 日志失败不影响交互 */ }
           if (busy || !this.isRunning) return;
-          const key = this.keyName(data);
+          const key = parseKeyName(data);
           const current = this.session.exercises[this.session.currentIndex];
 
           // 闪卡模式按键接管：输入简答 / enter 翻面（触发点评）/ esc 返回

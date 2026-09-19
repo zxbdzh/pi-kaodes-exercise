@@ -25,12 +25,13 @@ test('KaodesExtension - courseDetail 返回 null 时不应抛出 cstId 错误', 
   assert.ok(notifications.some((message) => message.includes('课程详情')));
 });
 
-test('KaodesExtension - 使用 Pi 标准选择器选择章节与小节', async () => {
+test('KaodesExtension - 分页选择器选择章节与小节（支持左右键翻页）', async () => {
   const tmpConfig = path.join(os.tmpdir(), `test-chapter-select-${Date.now()}.json`);
   const tmpCache = path.join(os.tmpdir(), `test-chapter-cache-${Date.now()}`);
   const ext = new KaodesExtension({ configPath: tmpConfig, cacheDir: tmpCache });
   let requestedCatId = '';
   const selectedTitles: string[] = [];
+  let customCalls = 0;
 
   ext.client = {
     getUserProductList: async () => [{ productId: 1, name: '测试科目' }],
@@ -64,16 +65,26 @@ test('KaodesExtension - 使用 Pi 标准选择器选择章节与小节', async (
   await ext.startChapterExercise(0, {
     ui: {
       input: async () => undefined,
-      select: async (title, options) => {
-        selectedTitles.push(title);
-        return options.find((option) => option.includes(title === '选择章节' ? '第二章' : '第二节'));
-      },
       notify: () => undefined,
-      custom: async <T>() => undefined as T,
+      custom: async <T>(factory: any): Promise<T> => {
+        customCalls++;
+        // 前两次 custom 调用来自分页选择器（选择章节 / 第二章小节）；
+        // 第三次起是答题 TUI 主组件，直接返回结束。
+        if (customCalls > 2) return undefined as T;
+        return new Promise<T>((resolve) => {
+          const comp = factory({ requestRender() {} }, undefined, {}, (v: T) => resolve(v));
+          selectedTitles.push(String(comp.render(80)[0]).replace(/\x1b\[[0-9;]*m/g, ''));
+          comp.handleInput?.('\x1b[C'); // → 翻页（单页时不应越界）
+          comp.handleInput?.('\x1b[D'); // ← 翻回
+          comp.handleInput?.('\x1b[B'); // ↓ 光标到第二项
+          comp.handleInput?.('\r'); // Enter 确认
+        });
+      },
     },
   });
 
-  assert.deepEqual(selectedTitles, ['选择章节', '第二章']);
+  assert.ok(selectedTitles[0]?.includes('选择章节'), `标题应为选择章节: ${selectedTitles[0]}`);
+  assert.ok(selectedTitles[1]?.includes('第二章'), `标题应为第二章: ${selectedTitles[1]}`);
   assert.equal(requestedCatId, 'section-2');
 });
 
