@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createPagedSelectComponent } from './pagedSelect.js';
+import { createPagedSelectComponent, PAGED_SELECT_BACK } from './pagedSelect.js';
 import { visibleWidth } from './exercise.js';
 
 interface Harness {
@@ -11,17 +11,17 @@ interface Harness {
   value: () => string | undefined;
 }
 
-function harness(items: string[], pageSize?: number): Harness {
+function harness(items: string[], pageSize?: number, backEnabled?: boolean): Harness {
   let renderCount = 0;
   let done = false;
   let result: string | undefined;
   const component = createPagedSelectComponent<string>(
     { requestRender: () => renderCount++ },
     undefined,
-    { title: '选择章节', items, format: (s) => s, pageSize },
+    { title: '选择章节', items, format: (s) => s, pageSize, backEnabled },
     (v) => {
       done = true;
-      result = v;
+      result = v as string | undefined;
     }
   );
   return {
@@ -141,4 +141,18 @@ test('pagedSelect - 单页列表不显示页码提示', () => {
   const lines = h.render().map(plain);
   assert.ok(!lines[0].includes('页)'));
   assert.ok(plain(lines[cursorIndex(lines)]).includes('1. 章节A'));
+});
+
+test('pagedSelect - Backspace 返回上级哨兵与提示', () => {
+  const h = harness(items40, undefined, true);
+  assert.ok(h.render().map(plain).some((l) => l.includes('⌫ 返回上级')));
+  h.press('\x7f');
+  assert.ok(h.settled());
+  assert.equal(h.value() as unknown, PAGED_SELECT_BACK);
+
+  // 未开启 backEnabled 时 Backspace 被忽略，不会误退出
+  const h2 = harness(items40);
+  h2.press('\x7f');
+  assert.ok(!h2.settled(), '默认不应响应 Backspace');
+  assert.ok(!h2.render().map(plain).some((l) => l.includes('⌫')));
 });

@@ -1,8 +1,8 @@
 import { AuthManager } from './auth/manager.js';
-import { KaodesClient } from './api/client.js';
+import { CourseListItem, KaodesClient, ProductItem } from './api/client.js';
 import { SessionCache } from './cache/session.js';
 import { ExerciseTUI, KAODES_HELP } from './tui/exercise.js';
-import { pagedSelect } from './tui/pagedSelect.js';
+import { PAGED_SELECT_BACK, pagedSelect } from './tui/pagedSelect.js';
 import { AiTutorEngine } from './tutor/engine.js';
 import { ChapterPracticeNode, PracticeSession } from './types.js';
 
@@ -77,27 +77,33 @@ export class KaodesExtension {
     this.tutor = new AiTutorEngine();
   }
 
+  /**
+   * 单级选择：返回 { item } 选中 / 'back' 按 ⌫ 回上一级 / null 取消退出。
+   */
   private async chooseItem<T>(
     commandContext: PiCommandContext | undefined,
     title: string,
     items: T[],
     format: (item: T) => string,
-    fallbackIndex = 0
-  ): Promise<T | null> {
+    initialIndex = 0
+  ): Promise<{ item: T } | 'back' | null> {
     if (!items.length) return null;
-    if (items.length === 1) return items[fallbackIndex] || items[0];
+    const start = Math.max(0, Math.min(items.length - 1, initialIndex));
+    if (items.length === 1) return { item: items[start] };
 
     const ui = commandContext?.ui;
-    // 优先用自带分页选择器：长章节列表可 ←/→ 翻页
+    // 优先用自带分页选择器：长列表 ←/→ 翻页，⌫ 逐级返回
     if (ui?.custom) {
-      return (await pagedSelect(ui, { title, items, format })) ?? null;
+      const picked = await pagedSelect(ui, { title, items, format, initialIndex: start, backEnabled: true });
+      if (picked === PAGED_SELECT_BACK) return 'back';
+      return picked === undefined ? null : { item: picked };
     }
-    if (!ui?.select) return items[fallbackIndex] || items[0];
+    if (!ui?.select) return { item: items[start] };
 
     const options = items.map((item, index) => `${index + 1}. ${format(item)}`);
     const selected = await ui.select(title, options);
     if (!selected) return null;
-    return items[options.indexOf(selected)] || null;
+    return { item: items[options.indexOf(selected)] ?? items[start] };
   }
 
   private chapterLabel(node: ChapterPracticeNode): string {
@@ -116,70 +122,134 @@ export class KaodesExtension {
       return;
     }
 
-    const selectedProduct = await this.chooseItem(
-      commandContext,
-      '选择科目',
-      products,
-      (product) => product.name,
-      courseIndex
-    );
-    if (!selectedProduct) return;
-    console.log(`\n[Kaodes] 正在加载科目: 《${selectedProduct.name}》...`);
+    // 逐级选择：0 科目 → 1 课程 → 2 课程详情/章节树 → 3 章节 → 4 小节；
+    // ⌫ 返回上一级重选，Esc / Ctrl+C 退出整个流程。
+    let level: 0 | 1 | 2 | 3 | 4 = 0;
+    let productIdx = courseIndex;
+    let courseIdx = 0;
+    let chapterIdx = 0;
+    let sectionIdx = 0;
+    let courseRows: CourseListItem[] = [];
+    let selectedProduct!: ProductItem;
+    let selectedCourse: CourseListItem | null = null;
+    let chapterNodes: ChapterPracticeNode[] = [];
+    let selectedChapter!: ChapterPracticeNode;
+    let selectedSection!: ChapterPracticeNode;
+    let cstId = 0;
+    let courseId = '';
 
-    // 产品列表通常不带课程 ID，先从官网同一接口解析真正的 courseID/cstid。
-    const courseRows = selectedProduct.courseId
-      ? []
-      : await this.client.getCourseList(selectedProduct.productId);
-    const selectedCourse = await this.chooseItem(
-      commandContext,
-      '选择课程',
-      courseRows,
-      (course) => course.courseName
-    );
-    if (!selectedProduct.courseId && courseRows.length > 0 && !selectedCourse) return;
-    const requestedCourseId = selectedProduct.courseId || selectedCourse?.courseID || '';
-    if (!requestedCourseId) {
-      const message = `科目《${selectedProduct.name}》没有返回课程列表，无法确定 courseId。`;
-      commandContext?.ui.notify(message, 'error');
-      console.error(`[Kaodes] ${message}`);
-      return;
-    }
+    for (;;) {
+      if (level === 0) {
+        const pick = await this.chooseItem(commandContext, '选择科目', products, (product) => product.name, productIdx);
+        if (!pick || pick === 'back') return; // 顶层再返回 = 直接退出
+        selectedProduct = pick.item;
+        productIdx = products.indexOf(selectedProduct);
+        selectedCourse = null;
+        courseIdx = 0;
+        chapterIdx = 0;
+        sectionIdx = 0;
+        console.log(`\n[Kaodes] 正在加载科目: 《${selectedProduct.name}》...`);
+        // 产品列表通常不带课程 ID，先从官网同一接口解析真正的 courseID/cstid。
+        courseRows = selectedProduct.courseId ? [] : await this.client.getCourseList(selectedProduct.productId);
+        level = 1;
+        continue;
+      }
 
-    const detail = await this.client.getCourseDetail(requestedCourseId, selectedProduct.productId);
-    if (!detail) {
-      const message = `科目《${selectedProduct.name}》没有返回课程详情，无法加载章节。`;
-      commandContext?.ui.notify(message, 'error');
-      console.error(`[Kaodes] ${message}`);
-      return;
-    }
-    const cstId = detail?.cstId || selectedCourse?.cstid || 0;
-    const courseId = detail?.courseId || requestedCourseId;
-    if (!cstId) {
-      const message = `科目《${selectedProduct.name}》没有返回有效 cstId，无法加载章节。`;
-      commandContext?.ui.notify(message, 'error');
-      console.error(`[Kaodes] ${message}`);
-      return;
-    }
-
-    // 获取章节树
-    const chapterTree = await this.client.getChapterTree(courseId, cstId, selectedProduct.productId);
-    const selectedChapter = await this.chooseItem(
-      commandContext,
-      '选择章节',
-      chapterTree.practiceChapter,
-      (chapter) => this.chapterLabel(chapter)
-    );
-    if (!selectedChapter) return;
-
-    const selectedSection = selectedChapter.children?.length
-      ? await this.chooseItem(
+      if (level === 1) {
+        if (!courseRows.length) {
+          level = 2; // 科目自带 courseId，跳过课程选择
+          continue;
+        }
+        const pick = await this.chooseItem(
           commandContext,
-          selectedChapter.name,
-          selectedChapter.children,
-          (section) => this.chapterLabel(section)
-        )
-      : selectedChapter;
-    if (!selectedSection) return;
+          '选择课程',
+          courseRows,
+          (course) => course.courseName,
+          courseIdx
+        );
+        if (!pick) return;
+        if (pick === 'back') {
+          level = 0;
+          continue;
+        }
+        selectedCourse = pick.item;
+        courseIdx = courseRows.indexOf(selectedCourse);
+        chapterIdx = 0;
+        sectionIdx = 0;
+        level = 2;
+        continue;
+      }
+
+      if (level === 2) {
+        const requestedCourseId = selectedProduct.courseId || selectedCourse?.courseID || '';
+        if (!requestedCourseId) {
+          const message = `科目《${selectedProduct.name}》没有返回课程列表，无法确定 courseId。`;
+          commandContext?.ui.notify(message, 'error');
+          console.error(`[Kaodes] ${message}`);
+          return;
+        }
+        const detail = await this.client.getCourseDetail(requestedCourseId, selectedProduct.productId);
+        if (!detail) {
+          const message = `科目《${selectedProduct.name}》没有返回课程详情，无法加载章节。`;
+          commandContext?.ui.notify(message, 'error');
+          console.error(`[Kaodes] ${message}`);
+          return;
+        }
+        cstId = detail?.cstId || selectedCourse?.cstid || 0;
+        courseId = detail?.courseId || requestedCourseId;
+        if (!cstId) {
+          const message = `科目《${selectedProduct.name}》没有返回有效 cstId，无法加载章节。`;
+          commandContext?.ui.notify(message, 'error');
+          console.error(`[Kaodes] ${message}`);
+          return;
+        }
+        // 获取章节树（每次进入本级都刷新，保证返回重选后进度最新）
+        const chapterTree = await this.client.getChapterTree(courseId, cstId, selectedProduct.productId);
+        chapterNodes = chapterTree.practiceChapter;
+        level = 3;
+        continue;
+      }
+
+      if (level === 3) {
+        const pick = await this.chooseItem(
+          commandContext,
+          '选择章节',
+          chapterNodes,
+          (chapter) => this.chapterLabel(chapter),
+          chapterIdx
+        );
+        if (!pick) return;
+        if (pick === 'back') {
+          level = courseRows.length ? 1 : 0;
+          continue;
+        }
+        selectedChapter = pick.item;
+        chapterIdx = chapterNodes.indexOf(selectedChapter);
+        sectionIdx = 0;
+        if (selectedChapter.children?.length) {
+          level = 4;
+          continue;
+        }
+        selectedSection = selectedChapter;
+        break;
+      }
+
+      // level === 4：小节
+      const pick = await this.chooseItem(
+        commandContext,
+        selectedChapter.name,
+        selectedChapter.children || [],
+        (section) => this.chapterLabel(section),
+        sectionIdx
+      );
+      if (!pick) return;
+      if (pick === 'back') {
+        level = 3;
+        continue;
+      }
+      selectedSection = pick.item;
+      break;
+    }
 
     const catId = selectedSection.catId || selectedChapter.catId;
     if (!catId) {

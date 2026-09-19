@@ -24,5 +24,7 @@ export function parseKeyName(data: string): string {
   if (/^\x1b\[27(;\d+)?u$/.test(data)) return 'escape';
   if (data === '\x1b') return 'escape';
   if (data === '\x03') return 'ctrl+c';
+  // 退格键：终端通常发 \x7f（DEL），个别环境发 \b
+  if (data === '\x7f' || data === '\b') return 'backspace';
   return data.length === 1 ? data.toLowerCase() : data;
 }

@@ -116,16 +116,17 @@ test('ExerciseTUI & SessionCache - 答题卡渲染与断点离线缓存', async 
         component!.handleInput?.('\x1b[A'); // up：选项光标移回 A
         component!.handleInput?.('\r'); // enter：确认光标所在选项 A
         assert.equal(mockSession.exercises[0].userKey, 'A');
-        component!.handleInput?.('\x1b'); // esc：触发退出对话框 → select → done
+        component!.handleInput?.('\x1b'); // esc：组件内自绘退出对话框
+        assert.ok(component!.render(80).some((line) => line.includes('退出练习')), '应渲染退出对话框');
+        component!.handleInput?.('\x1b'); // 再按 esc：继续答题
+        assert.ok(!component!.render(80).some((line) => line.includes('退出练习')));
+        component!.handleInput?.('\x1b'); // 重新打开
+        component!.handleInput?.('\x1b[B'); // ↓ 移到「不保存退出」
+        component!.handleInput?.('\r'); // Enter → 清断点并结束
       });
       return undefined as T;
     },
     input: async () => undefined,
-    select: async (title, options) => {
-      assert.equal(title, '退出练习');
-      assert.deepEqual(options, ['保存断点并退出', '不保存退出', '继续答题']);
-      return '不保存退出';
-    },
     notify: () => undefined,
   });
   assert.equal(mockSession.currentIndex, 0);
@@ -174,12 +175,12 @@ test('ExerciseTUI - 低调布局：session 底栏、指令输入行与多终端�
         // 主区域不出现快捷键说明
         assert.ok(!lines80.some((line) => line.includes('作答') || line.includes('交卷')));
 
-        component!.handleInput?.('\x1b'); // 未聚焦 → 退出选择 → 保存断点并退出
+        component!.handleInput?.('\x1b'); // esc → 退出对话框（光标默认在「保存断点并退出」）
+        component!.handleInput?.('\r'); // Enter → 保存并退出
       });
       return undefined as T;
     },
     input: async () => undefined,
-    select: async () => '保存断点并退出',
     notify: (message) => notified.push(message),
   });
   assert.deepEqual(notified, []);

@@ -69,7 +69,8 @@ export const KAODES_HELP = [
   '  ↑↓ 或 J / K    移动光标（跨页连续）',
   '  ←→ 或 H / L    上一页 / 下一页',
   '  Enter          确认选择',
-  '  Esc            取消',
+  '  ⌫ Backspace    返回上一级选择（科目页再按则退出）',
+  '  Esc            取消并退出',
   '',
   '答题页直接按键:',
   '  ↑/↓            移动选项光标',
@@ -82,7 +83,7 @@ export const KAODES_HELP = [
   '  T              AI 点拨（一键分析当前题）',
   '  F              快速问 AI（输入问题，回答可能附记忆卡）',
   '  C              查看记忆卡（AI 回答后生成，enter 翻面）',
-  '  Esc            退出练习（保存断点 / 不保存 / 继续）',
+  '  Esc            退出对话框（↑↓ 选择 · Enter 确认 · Esc 继续答题）',
   '  Ctrl+C         保存并退出',
   '',
   '答题页底部指令（按 : 或 / 聚焦输入框，Enter 提交，Esc 取消）:',
@@ -683,19 +684,32 @@ export class ExerciseTUI {
         }
       };
 
-      const exitDialog = (): void => {
-        void run(async () => {
-          const choice = ui.select
-            ? await ui.select('退出练习', ['保存断点并退出', '不保存退出', '继续答题'])
-            : '保存断点并退出';
-          if (choice === '保存断点并退出') {
-            this.cache.saveSession(this.session);
-            finish();
-          } else if (choice === '不保存退出') {
-            this.cache.clearSession(this.session.courseId, this.session.catId || 'default');
-            finish();
-          }
+      // 退出对话框在组件内自绘：Pi 的 ui.select 无法叠加在 custom 组件之上，
+      // 嵌套调用会因 Promise 永不 resolve 导致 busy 卡死（按键全部失效）。
+      const EXIT_OPTIONS = ['保存断点并退出', '不保存退出', '继续答题'];
+      let exitOpen = false;
+      let exitCursor = 0;
+
+      const renderExitDialog = (width: number): string[] => {
+        const lines: string[] = [];
+        lines.push(paint('accent', truncateWithEllipsis('退出练习', width)));
+        lines.push('');
+        EXIT_OPTIONS.forEach((option, index) => {
+          lines.push(
+            index === exitCursor
+              ? paint('accent', truncateWithEllipsis(`→ ${option}`, width))
+              : truncateWithEllipsis(`  ${option}`, width)
+          );
         });
+        lines.push('');
+        lines.push(paint('dim', truncateWithEllipsis('↑↓ 选择 · Enter 确认 · Esc 继续答题', width)));
+        return lines;
+      };
+
+      const openExitDialog = (): void => {
+        exitOpen = true;
+        exitCursor = 0;
+        tui.requestRender();
       };
 
       const submitAndFinish = (): void => {
@@ -815,7 +829,7 @@ export class ExerciseTUI {
               this.cache.clearSession(this.session.courseId, this.session.catId || 'default');
               finish();
             } else if (!arg) {
-              exitDialog();
+              openExitDialog();
             } else {
               setStatus('用法: exit [save|discard]', 'error');
             }
@@ -842,10 +856,41 @@ export class ExerciseTUI {
       };
 
       return {
-        render: (width: number) => this.renderLayout(width, { buffer, focused: inputFocused, status }, paint),
+        render: (width: number) =>
+          exitOpen
+            ? renderExitDialog(width)
+            : this.renderLayout(width, { buffer, focused: inputFocused, status }, paint),
         handleInput: (data: string) => {
           if (busy || !this.isRunning) return;
           const key = parseKeyName(data);
+
+          // 退出对话框模态：优先于答题 / 记忆卡 / 输入框处理
+          if (exitOpen) {
+            if (key === 'up' || key === 'k') exitCursor = Math.max(0, exitCursor - 1);
+            else if (key === 'down' || key === 'j') exitCursor = Math.min(EXIT_OPTIONS.length - 1, exitCursor + 1);
+            else if (key === 'enter') {
+              if (exitCursor === 0) {
+                this.cache.saveSession(this.session);
+                finish();
+                return;
+              }
+              if (exitCursor === 1) {
+                this.cache.clearSession(this.session.courseId, this.session.catId || 'default');
+                finish();
+                return;
+              }
+              exitOpen = false;
+            } else if (key === 'escape') {
+              exitOpen = false;
+            } else if (key === 'ctrl+c') {
+              this.cache.saveSession(this.session);
+              finish();
+              return;
+            } else return;
+            tui.requestRender();
+            return;
+          }
+
           const current = this.session.exercises[this.session.currentIndex];
 
           // 闪卡模式按键接管：输入简答 / enter 翻面（触发点评）/ esc 返回
@@ -898,7 +943,7 @@ export class ExerciseTUI {
             this.cache.saveSession(this.session);
             finish();
           } else if (key === 'escape') {
-            exitDialog();
+            openExitDialog();
           } else if (key === 't' && current && this.onAiTutor) {
             void run(() => this.onAiTutor!(current, 'hint'));
           } else if (key === 'f' && current && this.onAiTutor) {

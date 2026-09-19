@@ -10,7 +10,13 @@ export interface PagedSelectConfig<T> {
   pageSize?: number;
   /** 初始光标（绝对索引） */
   initialIndex?: number;
+  /** 允许 Backspace 返回上一级选择（done 收到 PAGED_SELECT_BACK） */
+  backEnabled?: boolean;
 }
+
+/** Backspace 逐级返回的哨兵值（与取消 undefined、选中 T 区分）。 */
+export const PAGED_SELECT_BACK = Symbol('kaodes-paged-select-back');
+export type PagedSelectPick<T> = T | typeof PAGED_SELECT_BACK | undefined;
 
 /** 仅依赖 Pi 的 ui.custom 通道。 */
 export interface PagedSelectUI {
@@ -62,7 +68,7 @@ export function createPagedSelectComponent<T>(
   tui: { requestRender(): void },
   theme: unknown,
   config: PagedSelectConfig<T>,
-  done: (value: T | undefined) => void
+  done: (value: PagedSelectPick<T>) => void
 ): PiExerciseComponent {
   const paint = makePainter(theme);
   const pageSize = Math.max(1, config.pageSize ?? 15);
@@ -71,7 +77,7 @@ export function createPagedSelectComponent<T>(
   let cursor = Math.max(0, Math.min(total - 1, config.initialIndex ?? 0));
   let settled = false;
 
-  const finish = (value: T | undefined): void => {
+  const finish = (value: PagedSelectPick<T>): void => {
     if (settled) return;
     settled = true;
     done(value);
@@ -102,7 +108,10 @@ export function createPagedSelectComponent<T>(
         );
       }
       lines.push('');
-      lines.push(paint('dim', ellipsis('↑↓ 移动 · ←→ 翻页 · Enter 选择 · Esc 取消', width)));
+      const hint = config.backEnabled
+        ? '↑↓ 移动 · ←→ 翻页 · Enter 选择 · ⌫ 返回上级 · Esc 取消'
+        : '↑↓ 移动 · ←→ 翻页 · Enter 选择 · Esc 取消';
+      lines.push(paint('dim', ellipsis(hint, width)));
       return lines;
     },
     handleInput: (data: string) => {
@@ -111,7 +120,11 @@ export function createPagedSelectComponent<T>(
       else if (key === 'down' || key === 'j') cursor = Math.min(total - 1, cursor + 1);
       else if (key === 'left' || key === 'h' || key === 'pageup') movePage(-1);
       else if (key === 'right' || key === 'l' || key === 'pagedown') movePage(1);
-      else if (key === 'enter') {
+      else if (key === 'backspace') {
+        if (!config.backEnabled) return;
+        finish(PAGED_SELECT_BACK);
+        return;
+      } else if (key === 'enter') {
         finish(config.items[cursor]);
         return;
       } else if (key === 'escape' || key === 'ctrl+c') {
@@ -124,9 +137,9 @@ export function createPagedSelectComponent<T>(
   };
 }
 
-/** 通过 ui.custom 打开分页选择器；取消时 resolve undefined。 */
-export function pagedSelect<T>(ui: PagedSelectUI, config: PagedSelectConfig<T>): Promise<T | undefined> {
-  return ui.custom<T | undefined>((tui, theme, _keybindings, done) =>
+/** 通过 ui.custom 打开分页选择器；取消 resolve undefined，⌫ resolve PAGED_SELECT_BACK。 */
+export function pagedSelect<T>(ui: PagedSelectUI, config: PagedSelectConfig<T>): Promise<PagedSelectPick<T>> {
+  return ui.custom<PagedSelectPick<T>>((tui, theme, _keybindings, done) =>
     createPagedSelectComponent(tui, theme, config, done)
   );
 }
