@@ -103,6 +103,7 @@ export const KAODES_HELP = [
   '  ask | f                 快速问 AI',
   '  card | c                查看记忆卡',
   '  hl [on|off]             规则高亮开关',
+  '  hll                     手动触发 LLM 考点抽取（额外 token）',
   '  exit [save|discard]     退出（可指定保存 / 不保存）',
   '',
   '规则高亮配色:',
@@ -937,6 +938,31 @@ export class ExerciseTUI {
             }
             this.setHighlightEnabled(on);
             setStatus(`规则高亮已${on ? '开启' : '关闭'}`, 'success');
+            return;
+          }
+          case 'hll': {
+            // 手动触发 LLM 考点抽取（额外 token）
+            const cur = this.session.exercises[this.session.currentIndex];
+            if (!cur) {
+              setStatus('当前无题目', 'error');
+              return;
+            }
+            setStatus('正在调用 AI 提取考点...', 'busy');
+            run(async () => {
+              try {
+                const onAiTutor = this.onAiTutor;
+                if (onAiTutor) {
+                  // 复用 AI 点拨路径，但只用于抽取高亮词
+                  await onAiTutor(cur, 'hint');
+                  // 如果主回答没带【高亮】，兜底会尝试轻量抽取
+                  setStatus(cur.llmMarks?.length ? 'LLM 考点已标注' : '未找到考点（仅规则词典生效）', 'info');
+                } else {
+                  setStatus('AI 暂不可用', 'error');
+                }
+              } catch (e) {
+                setStatus('AI 调用失败：' + (e instanceof Error ? e.message : String(e)), 'error');
+              }
+            });
             return;
           }
           case 'card':

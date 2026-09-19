@@ -633,7 +633,7 @@ export class KaodesExtension {
       exer.a ? `A. ${exer.a}\n` : ''
     }${exer.b ? `B. ${exer.b}\n` : ''}${exer.c ? `C. ${exer.c}\n` : ''}${
       exer.d ? `D. ${exer.d}\n` : ''
-    }\n请只输出一行高亮标注，格式为：【高亮】题眼:<词>;易错:<词>;结论:<词>\n不要输出任何其他文字或解释。`;
+    }\n请从题目中找出 1-3 个考点词，按以下格式只输出一行：\n【高亮】题眼：<词 1>,<词 2>;易错:<词>;结论:<词>\n不要输出任何其他文字或解释。`;
 
     const registry = commandContext.modelRegistry as
       | { complete(model: unknown, context: unknown): Promise<{ content?: Array<{ type: string; text?: string }>; errorMessage?: string }> }
