@@ -411,29 +411,65 @@ export class KaodesExtension {
   }
 
   /**
-   * 启动错题本复习
+   * 启动错题本复习：云端错题本优先，接口异常时回落到本地断点中答错的题（不依赖云端）。
    */
   public async startWrongQuestions(commandContext?: PiCommandContext): Promise<void> {
-    const products = await this.client.getUserProductList();
-    if (!products.length) return;
-    const prod = products[0];
-
-    console.log(`\n[Kaodes] 正在查询《${prod.name}》错题本...`);
-    const wrongs = await this.client.getWrongQuestions(String(prod.productId));
-    if (!wrongs.length) {
-      console.log('✓ 恭喜！当前科目错题本为空。');
-      return;
+    try {
+      const products = await this.client.getUserProductList();
+      if (products.length) {
+        const prod = products[0];
+        const wrongs = await this.client.getWrongQuestions(String(prod.productId));
+        if (wrongs.length) {
+          await this.runWrongSession(prod.productId, prod.name, '错题本精练攻坚', wrongs, commandContext);
+          return;
+        }
+      }
+    } catch {
+      // 云端错题本接口异常（如 errorsCollect/findWrong 500），回落本地
     }
 
+    // 本地回落：收集所有断点 session 里答错的题（按题去重）
+    const local = this.collectLocalWrong();
+    if (!local.length) {
+      commandContext?.ui.notify('云端错题本暂不可用，且本地断点没有错题记录。', 'warning');
+      return;
+    }
+    commandContext?.ui.notify(
+      `云端错题本暂不可用，已改用本地错题重练：${local.length} 道`,
+      'info'
+    );
+    await this.runWrongSession(0, '本地错题', '错题本·本地重练', local, commandContext);
+  }
+
+  /** 收集本地所有断点里答错的题（按 exerId 去重，重置作答状态）。 */
+  private collectLocalWrong(): import('./types.js').ExerciseItem[] {
+    const byId = new Map<number, import('./types.js').ExerciseItem>();
+    for (const session of this.cache.listSessions()) {
+      for (const item of session.exercises || []) {
+        if (item.doResult === -1 && item.exerId && !byId.has(item.exerId)) {
+          byId.set(item.exerId, { ...item, doResult: 0, userKey: null, viewAnswer: 0 });
+        }
+      }
+    }
+    return [...byId.values()];
+  }
+
+  private async runWrongSession(
+    productId: number,
+    courseName: string,
+    chapterName: string,
+    wrongs: import('./types.js').ExerciseItem[],
+    commandContext?: PiCommandContext
+  ): Promise<void> {
     const session: PracticeSession = {
       prId: Date.now(),
       scoringMethod: 1,
-      courseId: String(prod.productId),
-      courseName: prod.name,
-      productId: prod.productId,
+      courseId: String(productId),
+      courseName,
+      productId,
       cstId: 0,
       catId: 'wrong',
-      chapterName: '错题本精练攻坚',
+      chapterName,
       exercises: wrongs.map((e, idx) => ({
         ...e,
         exerId: e.exerID || e.exerId || idx + 1,
