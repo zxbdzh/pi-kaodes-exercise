@@ -101,6 +101,59 @@ export function commonPrefixLength(texts: string[]): number {
   return lcp.length;
 }
 
+/** 【…】标签用固定青色，给 AI 回复的分区（记忆卡/问/要点）提供视觉结构。 */
+export const LABEL_ANSI = '\x1b[36m';
+
+/**
+ * 在纯文本上按 marks 注入固定 ANSI 高亮，返回可直接交给终端渲染的字符串。
+ * 宿主 pi-tui 的 wrapTextWithAnsi / visibleWidth 均兼容内嵌 ANSI，宽度计算不受影响。
+ */
+export function applyAnsiMarks(text: string, marks: Mark[] | undefined): string {
+  if (!text || !marks?.length) return text;
+  let out = '';
+  let pos = 0;
+  for (const mark of marks) {
+    if (mark.start < pos || mark.end > text.length) continue;
+    out += text.slice(pos, mark.start) + markAnsi(mark.kind) + text.slice(mark.start, mark.end) + RESET_ANSI;
+    pos = mark.end;
+  }
+  return out + text.slice(pos);
+}
+
+/**
+ * 给 AI 回复整体上色：先按考点词上高亮，再给【…】分区标签上青色。
+ * 标签后处理是为了避免标签内的 ANSI 码干扰词面定位；二者重叠时终端可正常嵌套渲染。
+ */
+export function paintAiAnswer(text: string, marks: Mark[] | undefined): string {
+  const painted = applyAnsiMarks(text, marks);
+  return painted.replace(/【[^】\x1b]{1,12}】/g, (label) => LABEL_ANSI + label + RESET_ANSI);
+}
+
+/** 显示用：剥离 AI 输出里的 markdown 加粗/斜体星号（终端无渲染意义，留着是噪声）。 */
+export function stripMd(text: string): string {
+  return text.replace(/\*{1,3}([^*]*)\*{1,3}/g, '$1').replace(/`/g, '');
+}
+
+/**
+ * AI 回复专用高亮：只用 LLM 考点词、每词仅首次出现、总数封顶。
+ * 规则词典是为短题干设计的，扫长回答会命中过多把文本刷成彩虹；
+ * LLM 词本身 1-3 个，首现 + 封顶后密度自然可控。
+ */
+export function marksForAnswer(
+  text: string,
+  terms: HighlightTerm[] | undefined,
+  cap = 4
+): Mark[] {
+  if (!text || !terms?.length) return [];
+  const raw: Mark[] = [];
+  for (const { term, kind } of terms) {
+    if (!term) continue;
+    const at = text.indexOf(term);
+    if (at >= 0) raw.push({ start: at, end: at + term.length, kind });
+  }
+  return raw.sort((a, b) => a.start - b.start).slice(0, cap);
+}
+
 /** LLM 抽取出的一个高亮词及其语义类型（可序列化，缓存进 session）。 */
 export interface HighlightTerm {
   term: string;

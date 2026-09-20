@@ -22,6 +22,12 @@ export interface KaodesConfig {
   lastUpdated?: string;
 }
 
+/** AI 对话单轮：追问面板用的多轮历史，随 session 持久化。 */
+export interface ChatTurn {
+  role: 'user' | 'assistant';
+  content: string;
+}
+
 export interface ExerciseItem {
   exerId: number;
   exerID?: number;
@@ -49,6 +55,8 @@ export interface ExerciseItem {
    * 渲染时映射为偏移区间并与规则高亮合并；离线/未调用时为空，自动回落规则高亮。
    */
   llmMarks?: Array<{ term: string; kind: 'key' | 'warn' | 'concl' }>;
+  /** 当前题的 AI 对话历史（F 面板多轮追问 + T 点拨结论），随 session 缓存。 */
+  chatHistory?: ChatTurn[];
 }
 
 export interface ChapterPracticeNode {

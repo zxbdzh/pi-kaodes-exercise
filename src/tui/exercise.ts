@@ -1,11 +1,31 @@
 import readline from 'node:readline';
 import { parseKeyName } from './keys.js';
-import { commonPrefixLength, findMarks, marksFromTerms, mergeMarks, markAnsi, DIM_ANSI, RESET_ANSI, Mark } from './highlight.js';
-import { ExerciseItem, PracticeSession } from '../types.js';
+import { commonPrefixLength, findMarks, marksFromTerms, mergeMarks, markAnsi, marksForAnswer, stripMd, DIM_ANSI, RESET_ANSI, Mark } from './highlight.js';
+import { ExerciseItem, PracticeSession, ChatTurn } from '../types.js';
 import { KaodesClient } from '../api/client.js';
 import { SessionCache } from '../cache/session.js';
+import { Flashcard, FlashcardStore } from '../cards/store.js';
 
 export type OnAiTutorCallback = (exer: ExerciseItem, mode: 'hint' | 'flashcard') => Promise<void>;
+
+/**
+ * 入卡回调（按 Y 触发）：宿主负责 LLM 组卡与持久化，返回状态消息；null 表示失败。
+ * cardCtx 由 TUI 从当前 session 取：相似错题标题（相似题线索）与归属信息。
+ */
+export type OnAddCardCallback = (
+  exer: ExerciseItem,
+  cardCtx: { siblingTitles: string[]; courseId: string; chapterName?: string }
+) => Promise<string | null>;
+
+/**
+ * AI 追问回调：exercise 只管面板与历史，LLM 通道由宿主注入。
+ * history 不含本次 question；返回 null 表示 AI 不可用。
+ */
+export type OnChatAskCallback = (
+  exer: ExerciseItem,
+  history: ChatTurn[],
+  question: string
+) => Promise<string | null>;
 
 /** AI 记忆卡：从 AI 回答中提取，按 C 查看 */
 export interface MemoryCard {
@@ -42,7 +62,7 @@ export interface PiExerciseComponent {
 export interface PiExerciseUI {
   custom<T>(
     factory: (
-      tui: { requestRender(): void },
+      tui: { requestRender(force?: boolean): void },
       theme: unknown,
       keybindings: unknown,
       done: (value: T) => void
@@ -84,9 +104,11 @@ export const KAODES_HELP = [
   '  ←/→ 或 N / P   上一题 / 下一题',
   '  S              保存进度（本地 + 云端）',
   '  Q              交卷并退出',
-  '  T              AI 点拨（一键分析当前题）',
-  '  F              快速问 AI（输入问题，回答可能附记忆卡）',
-  '  C              查看记忆卡（AI 回答后生成，enter 翻面）',
+  '  T              AI 点拨（一键分析当前题，结论进入对话历史）',
+  '  F              AI 追问面板（多轮对话，esc 返回答题）',
+  '  K              闪卡抽卡复习（错得多 / 久未复习优先，enter 翻面）',
+  '  Y              答错后按 Y，AI 组卡加入闪卡集',
+  '  W              错题回顾（↑↓ 选择，enter 跳到该题）',
   '  Esc            退出对话框（↑↓ 选择 · Enter 确认 · Esc 继续答题）',
   '  Ctrl+C         保存并退出',
   '',
@@ -100,8 +122,9 @@ export const KAODES_HELP = [
   '  save | s                保存进度',
   '  submit | q              交卷并退出',
   '  hint | t                AI 点拨',
-  '  ask | f                 快速问 AI',
-  '  card | c                查看记忆卡',
+  '  ask | f                 AI 追问面板（多轮对话）',
+  '  card | k                闪卡抽卡复习',
+  '  wrong | w               错题集中回顾',
   '  hl [on|off]             规则高亮开关',
   '  hll                     手动触发 LLM 考点抽取（额外 token）',
   '  exit [save|discard]     退出（可指定保存 / 不保存）',
@@ -281,6 +304,20 @@ export class ExerciseTUI {
   private client: KaodesClient;
   private cache: SessionCache;
   private onAiTutor?: OnAiTutorCallback;
+  /** AI 追问面板：LLM 通道（宿主注入）与面板状态 */
+  private onChatAsk?: OnChatAskCallback;
+  private chatMode = false;
+  private chatBusy = false;
+  /** 闪卡集：答错按 Y 入卡（LLM 组卡由宿主注入），K 键抽卡复习 */
+  private onAddCard?: OnAddCardCallback;
+  private cardMode = false;
+  private cardDeck: Flashcard[] = [];
+  private cardCursor = 0;
+  private cardFlipped = false;
+  private cards?: FlashcardStore;
+  /** 错题回顾模式：w 键 / :wrong 进入，主区域列出本 session 全部错题 */
+  private wrongMode = false;
+  private wrongCursor = 0;
   private isRunning = false;
   /** 选项列表光标（上下键移动，Enter 确认），提问插件同款交互。 */
   private optionCursor = 0;
@@ -288,22 +325,24 @@ export class ExerciseTUI {
   private highlightEnabled = true;
   /** 高亮开关变化时的持久化回调（由宿主注入，写入用户偏好）。 */
   private onHighlightChange?: (on: boolean) => void;
-  /** AI 记忆卡（从最近一次 AI 回答中提取，按 C 查看） */
-  private memoryCard: MemoryCard | undefined;
-  /** 记忆卡查看状态：正面 / 背面 */
-  private memoryCardFlipped = false;
 
   constructor(
     session: PracticeSession,
     client: KaodesClient,
     cache: SessionCache,
     onAiTutor?: OnAiTutorCallback,
-    options?: { highlightEnabled?: boolean; onHighlightChange?: (on: boolean) => void }
+    options?: {
+      highlightEnabled?: boolean;
+      onHighlightChange?: (on: boolean) => void;
+      /** 闪卡集存储（K 抽卡复习数据源）；缺省时 K 键提示不可用 */
+      cards?: FlashcardStore;
+    }
   ) {
     this.session = session;
     this.client = client;
     this.cache = cache;
     this.onAiTutor = onAiTutor;
+    this.cards = options?.cards;
     if (options?.highlightEnabled !== undefined) this.highlightEnabled = options.highlightEnabled;
     this.onHighlightChange = options?.onHighlightChange;
   }
@@ -382,6 +421,8 @@ export class ExerciseTUI {
       const cursor = Math.min(this.optionCursor, opts.length - 1);
       // 选项公共前缀弱化：只突出真正有区分度的差异部分（规则层，无 LLM）
       const lcp = this.highlightEnabled ? commonPrefixLength(opts.map((o) => o.text!)) : 0;
+      // 未作答前选项不上考点词：哪个词被标色本身就是答案线索（剧透）；作答/看解析后恢复为复习标注
+      const answered = !!cur.userKey || !!cur.viewAnswer;
       for (const [index, option] of opts.entries()) {
         // Pi 官方 select 同款：→ 指示光标行，其余行两空格缩进，Enter 确认
         const pointer = index === cursor ? '→' : ' ';
@@ -390,7 +431,7 @@ export class ExerciseTUI {
         lines.push({
           text,
           color: index === cursor ? 'accent' : 'text',
-          marks: marksOf(text),
+          marks: answered ? marksOf(text) : undefined,
           dim: lcp ? { start: textStart, end: textStart + lcp } : undefined,
         });
       }
@@ -409,6 +450,117 @@ export class ExerciseTUI {
       }
     }
 
+    return lines;
+  }
+
+  /**
+   * AI 追问面板行（chatMode 时作为 renderLayout 主区域数据源）。
+   * AI 回复行与题目区共用同一套考点高亮（规则词典 + 本题 llmMarks）。
+   */
+  private chatLinesStyled(): Array<{
+    text: string;
+    color: string;
+    marks?: Mark[];
+    dim?: { start: number; end: number };
+  }> {
+    const cur = this.session.exercises[this.session.currentIndex];
+    const history = cur?.chatHistory ?? [];
+    const head: Array<{ text: string; color: string; marks?: Mark[] }> = [
+      { text: `AI 对话 · 第 ${this.session.currentIndex + 1} 题`, color: 'accent' },
+      { text: '', color: 'text' },
+    ];
+    if (!history.length) {
+      head.push({
+        text: '输入问题，enter 发送 · esc 返回答题 · 回答自动标注考点，可继续追问',
+        color: 'muted',
+      });
+      return head;
+    }
+    for (const turn of history) {
+      // 保留 AI 回复原有的换行结构：首行带前缀，后续行缩进对齐；显示层去掉 markdown 星号
+      const rows = stripMd(turn.content).split(/\r?\n/).filter((row) => row.trim().length > 0);
+      const prefix = turn.role === 'user' ? '你' : 'AI';
+      rows.forEach((row, rowIndex) => {
+        const text = rowIndex === 0 ? `${prefix}  ${row}` : `   ${row}`;
+        head.push({
+          text,
+          color: turn.role === 'user' ? 'accent' : 'text',
+          marks: turn.role === 'assistant' ? marksForAnswer(text, cur?.llmMarks) : undefined,
+        });
+      });
+      head.push({ text: '', color: 'text' });
+    }
+    if (this.chatBusy) head.push({ text: '… 思考中', color: 'muted' });
+    else if (!this.chatBusy && history[history.length - 1]?.role === 'assistant') {
+      head.push({ text: '继续输入可追问 · esc 返回答题', color: 'muted' });
+    }
+    // 只保留尾部，长对话不撑爆主区域
+    return head.slice(-300);
+  }
+
+  /**
+   * 闪卡复习行（cardMode 时作为 renderLayout 主区域数据源）。
+   * 与题目/对话视图共用同一套框与换行渲染，不再维护独立框渲染副本。
+   */
+  private cardLinesStyled(): Array<{ text: string; color: string; marks?: Mark[]; dim?: { start: number; end: number } }> {
+    const card = this.cardDeck[this.cardCursor];
+    if (!card) return [{ text: '闪卡集为空', color: 'muted' }];
+    const total = this.cardDeck.length;
+    const lines: Array<{ text: string; color: string; marks?: Mark[]; dim?: { start: number; end: number } }> = [
+      { text: `闪卡复习 · ${this.cardCursor + 1}/${total} 张 · 累计错 ${card.wrongCount} 次`, color: 'accent' },
+      { text: '', color: 'text' },
+    ];
+    // question/keyPoints 缺内容时给占位，避免渲染空块
+    const question = card.question || '（无问题内容）';
+    const keyPoints = card.keyPoints || '（无补充要点）';
+    if (this.cardFlipped) {
+      lines.push({ text: `问  ${question}`, color: 'muted' });
+      lines.push({ text: '', color: 'text' });
+      lines.push({ text: '要点', color: 'accent' });
+      lines.push({ text: keyPoints, color: 'text' });
+      lines.push({ text: '', color: 'text' });
+      lines.push({ text: 'enter 下一张 · esc 退出复习', color: 'muted' });
+    } else {
+      lines.push({ text: question, color: 'text' });
+      lines.push({ text: '', color: 'text' });
+      lines.push({ text: 'enter 翻面看要点 · esc 退出复习', color: 'muted' });
+    }
+    return lines;
+  }
+
+  /** 本 session 全部答错的题（保持题序）。 */
+  private wrongItems(): Array<{ exer: ExerciseItem; index: number }> {
+    return this.session.exercises
+      .map((exer, index) => ({ exer, index }))
+      .filter((item) => item.exer.doResult === -1);
+  }
+
+  /**
+   * 错题回顾行（wrongMode 时作为 renderLayout 主区域数据源）。
+   */
+  private wrongLinesStyled(): Array<{ text: string; color: string; marks?: Mark[]; dim?: { start: number; end: number } }> {
+    const items = this.wrongItems();
+    const lines: Array<{ text: string; color: string }> = [
+      { text: `错题回顾 · ${items.length} 道（enter 跳到该题）`, color: 'accent' },
+      { text: '', color: 'text' },
+    ];
+    if (!items.length) {
+      lines.push({ text: '本题集暂无错题，继续保持！', color: 'muted' });
+      return lines;
+    }
+    this.wrongCursor = Math.min(this.wrongCursor, items.length - 1);
+    items.forEach((item, cursor) => {
+      const pointer = cursor === this.wrongCursor ? '→' : ' ';
+      const mine = item.exer.userKey || '未答';
+      const right = item.exer.rightKey || (item.exer.rightKeyList || []).join('') || '?';
+      const title = item.exer.title.length > 24 ? `${item.exer.title.slice(0, 24)}…` : item.exer.title;
+      lines.push({
+        text: `${pointer} ${item.index + 1}. ${title}（你答 ${mine} · 正确 ${right}）`,
+        color: cursor === this.wrongCursor ? 'accent' : 'text',
+      });
+    });
+    lines.push({ text: '', color: 'text' });
+    lines.push({ text: '↑↓ 选择 · enter 跳到该题 · esc 返回答题', color: 'muted' });
     return lines;
   }
 
@@ -464,6 +616,24 @@ export class ExerciseTUI {
 
   public setOnAiTutor(callback: OnAiTutorCallback): void {
     this.onAiTutor = callback;
+  }
+
+  public setOnChatAsk(callback: OnChatAskCallback): void {
+    this.onChatAsk = callback;
+  }
+
+  public setOnAddCard(callback: OnAddCardCallback): void {
+    this.onAddCard = callback;
+  }
+
+  /** K 键 / :card 入口：按优先级抽 10 张进入复习模式；空集返回 false。 */
+  public openCardReview(): boolean {
+    if (!this.cards || !this.cards.size()) return false;
+    this.cardDeck = this.cards.draw(10);
+    this.cardCursor = 0;
+    this.cardFlipped = false;
+    this.cardMode = true;
+    return true;
   }
 
   /** 规则高亮开关：on 开启 / off 关闭，返回当前状态。 */
@@ -567,73 +737,6 @@ export class ExerciseTUI {
   }
 
   /**
-   * 记忆卡查看渲染（C 键触发）：正面问题 / 背面要点，Anki 式翻面。
-   */
-  private renderMemoryCard(
-    width: number,
-    state: { buffer: string; focused: boolean; status?: BottomStatus },
-    paint: ThemePainter
-  ): string[] {
-    const card = this.memoryCard!;
-    const safeWidth = Math.max(1, width);
-    const lines: string[] = [];
-
-    const body: Array<{ text: string; color: string }> = [
-      { text: `记忆卡 · ${this.memoryCardFlipped ? '背面' : '正面'}`, color: 'accent' },
-      { text: '', color: 'text' },
-    ];
-    if (this.memoryCardFlipped) {
-      body.push({ text: `问  ${card.question}`, color: 'muted' });
-      body.push({ text: '', color: 'text' });
-      body.push({ text: '要点', color: 'accent' });
-      body.push({ text: card.keyPoints || '（无补充要点）', color: 'text' });
-      body.push({ text: '', color: 'text' });
-      body.push({ text: 'enter/esc 返回答题', color: 'muted' });
-    } else {
-      body.push({ text: card.question, color: 'text' });
-      body.push({ text: '', color: 'text' });
-      body.push({ text: 'enter 翻面看要点 · esc 返回答题', color: 'muted' });
-    }
-
-    if (safeWidth >= 6) {
-      const innerW = safeWidth - 2;
-      const contentW = Math.max(1, innerW - 2);
-      lines.push(paint('borderMuted', `╭${'─'.repeat(innerW)}╮`));
-      for (const raw of body) {
-        const wrapped = wrapPlain(raw.text, contentW);
-        if (wrapped.length === 0) {
-          lines.push(paint('borderMuted', `│`) + ' ' + ' '.repeat(contentW) + ' ' + paint('borderMuted', `│`));
-          continue;
-        }
-        for (const seg of wrapped) {
-          lines.push(
-            paint('borderMuted', `│`) +
-              ' ' +
-              paint(raw.color, padPlain(seg, contentW)) +
-              ' ' +
-              paint('borderMuted', `│`)
-          );
-        }
-      }
-      lines.push(paint('borderMuted', `╰${'─'.repeat(innerW)}╯`));
-    } else {
-      for (const raw of body) {
-        const wrapped = wrapPlain(raw.text, safeWidth);
-        if (wrapped.length === 0) lines.push('');
-        for (const seg of wrapped) lines.push(paint(raw.color, seg));
-      }
-    }
-
-    // 底栏与主界面共用：状态优先，否则 session 行；记忆卡模式下不显示指令输入行
-    const bottomPlain = state.status
-      ? `${STATUS_PREFIX[state.status.level]}${state.status.text}`
-      : this.sessionLineText();
-    const bottomColor = state.status ? STATUS_COLOR[state.status.level] : 'dim';
-    lines.push(paint(bottomColor, truncateWithEllipsis(bottomPlain, safeWidth)));
-    return lines;
-  }
-
-  /**
    * 行内分段着色：在已换行的纯文本片段上按 marks / dim 区间切 run 后逐段上色。
    * 关键约束：先定宽截断、后包 ANSI，宽度计算永远只看纯文本。
    */
@@ -686,16 +789,12 @@ export class ExerciseTUI {
     const safeWidth = Math.max(1, width);
     const lines: string[] = [];
 
-    if (this.memoryCard) {
-      // 记忆卡查看模式：主区域替换为卡片正面/背面
-      return this.renderMemoryCard(width, state, paint);
-    }
     if (safeWidth >= 6) {
       const innerW = safeWidth - 2;
       const contentW = Math.max(1, innerW - 2);
       // Pi 原生编辑器同款：边框 borderMuted，内容按语义分层着色
       lines.push(paint('borderMuted', `╭${'─'.repeat(innerW)}╮`));
-      for (const raw of this.bodyLinesStyled()) {
+      for (const raw of this.cardMode ? this.cardLinesStyled() : this.wrongMode ? this.wrongLinesStyled() : this.chatMode ? this.chatLinesStyled() : this.bodyLinesStyled()) {
         const wrapped = wrapPlainWithOffsets(raw.text, contentW);
         if (wrapped.length === 0) {
           lines.push(paint('borderMuted', `│`) + ' ' + ' '.repeat(contentW) + ' ' + paint('borderMuted', `│`));
@@ -712,7 +811,7 @@ export class ExerciseTUI {
       lines.push(paint('borderMuted', `╰${'─'.repeat(innerW)}╯`));
     } else {
       // 极窄终端退化：无边框纯文本，保证不重叠、不越界。
-      for (const raw of this.bodyLinesStyled()) {
+      for (const raw of this.cardMode ? this.cardLinesStyled() : this.wrongMode ? this.wrongLinesStyled() : this.chatMode ? this.chatLinesStyled() : this.bodyLinesStyled()) {
         const wrapped = wrapPlainWithOffsets(raw.text, safeWidth);
         if (wrapped.length === 0) lines.push('');
         for (const seg of wrapped) {
@@ -780,6 +879,11 @@ export class ExerciseTUI {
         done(undefined);
       };
 
+      // 模态视图（闪卡/对话/错题/退出框）行数与答题视图不同，
+      // 普通 requestRender 走宿主行级 diff，切换瞬间会残留旧帧行（错位）；
+      // 强制全量重绘根除该问题。
+      const redraw = (): void => tui.requestRender(true);
+
       const run = async (action: () => Promise<void>) => {
         if (busy) return;
         busy = true;
@@ -805,7 +909,7 @@ export class ExerciseTUI {
         } else if (cur.doResult === 1) {
           setStatus('回答正确', 'success');
         } else if (cur.doResult === -1) {
-          setStatus('回答错误', 'error');
+          setStatus(this.onAddCard ? '回答错误 · 按 Y 加入闪卡集' : '回答错误', 'error');
         }
       };
 
@@ -834,7 +938,7 @@ export class ExerciseTUI {
       const openExitDialog = (): void => {
         exitOpen = true;
         exitCursor = 0;
-        tui.requestRender();
+        redraw();
       };
 
       const submitAndFinish = (): void => {
@@ -924,9 +1028,9 @@ export class ExerciseTUI {
           }
           case 'ask':
           case 'f': {
-            // 快速问 AI：与 F 键同路径
-            const cur = this.session.exercises[this.session.currentIndex];
-            if (cur && this.onAiTutor) void run(() => this.onAiTutor!(cur, 'flashcard'));
+            // AI 追问面板（与 F 键同路径）：多轮对话，esc 返回答题
+            if (this.onChatAsk) openChat();
+            else setStatus('AI 通道未就绪', 'error');
             return;
           }
           case 'hl':
@@ -967,19 +1071,24 @@ export class ExerciseTUI {
             });
             return;
           }
-          case 'card':
-          case 'c': {
-            // 查看记忆卡（若有）
-            if (this.memoryCard) {
-              if (!this.memoryCardFlipped) {
-                this.memoryCardFlipped = true;
-              } else {
-                this.memoryCard = undefined;
-              }
-              tui.requestRender();
-            } else {
-              setStatus('暂无记忆卡：先按 F 问 AI，回答含记忆卡时自动保存', 'info');
+          case 'wrong':
+          case 'w': {
+            // 错题集中回顾：列出本 session 全部答错的题
+            const wrongCount = this.wrongItems().length;
+            if (!wrongCount) {
+              setStatus('暂无错题', 'info');
+              return;
             }
+            this.wrongMode = true;
+            this.wrongCursor = 0;
+            redraw();
+            return;
+          }
+          case 'card':
+          case 'k': {
+            // 闪卡复习：按优先级抽卡（错得多 / 久未复习优先）
+            if (!this.openCardReview()) setStatus('闪卡集为空：答错题目后按 Y 加入闪卡', 'info');
+            redraw();
             return;
           }
           case 'exit':
@@ -1010,6 +1119,43 @@ export class ExerciseTUI {
         inputFocused = false;
         tui.requestRender();
         if (raw.trim()) executeCommand(raw);
+      };
+
+      // 面板内发送追问：先落 user 轮再调 LLM，失败撤回避免历史残留无回应问句
+      const submitChat = (): void => {
+        const cur = this.session.exercises[this.session.currentIndex];
+        const question = buffer.trim();
+        if (!question || !cur || !this.onChatAsk || this.chatBusy) return;
+        buffer = '';
+        const history = cur.chatHistory ?? (cur.chatHistory = []);
+        history.push({ role: 'user', content: question });
+        this.chatBusy = true;
+        tui.requestRender();
+        void (async () => {
+          try {
+            const answer = await this.onChatAsk!(cur, history.slice(0, -1), question);
+            if (answer) {
+              history.push({ role: 'assistant', content: answer });
+              this.cache.saveSession(this.session);
+            } else {
+              history.pop();
+              setStatus('当前会话无可用模型', 'error', 6000);
+            }
+          } catch (error) {
+            history.pop();
+            setStatus('AI 调用失败：' + (error instanceof Error ? error.message : String(error)), 'error', 6000);
+          } finally {
+            this.chatBusy = false;
+            redraw();
+          }
+        })();
+      };
+
+      const openChat = (): void => {
+        this.chatMode = true;
+        inputFocused = true;
+        buffer = '';
+        redraw();
       };
 
       const cancelInput = (): void => {
@@ -1043,8 +1189,10 @@ export class ExerciseTUI {
                 return;
               }
               exitOpen = false;
+              redraw();
             } else if (key === 'escape') {
               exitOpen = false;
+              redraw();
             } else if (key === 'ctrl+c') {
               this.cache.saveSession(this.session);
               finish();
@@ -1056,22 +1204,82 @@ export class ExerciseTUI {
 
           const current = this.session.exercises[this.session.currentIndex];
 
-          // 闪卡模式按键接管：输入简答 / enter 翻面（触发点评）/ esc 返回
-          if (this.memoryCard) {
-            // 记忆卡查看模式：enter 翻面 / esc 或翻面后 enter 返回
+          // 错题回顾模态：↑↓ 选择，enter 跳到该题，esc 返回答题
+          if (this.wrongMode) {
+            const items = this.wrongItems();
             if (key === 'escape') {
-              this.memoryCard = undefined;
-              tui.requestRender();
+              this.wrongMode = false;
+              redraw();
+              return;
+            }
+            if (key === 'up') this.wrongCursor = Math.max(0, this.wrongCursor - 1);
+            else if (key === 'down') this.wrongCursor = Math.min(items.length - 1, this.wrongCursor + 1);
+            else if (data === '\r' || data === '\n') {
+              if (items[this.wrongCursor]) {
+                this.jumpTo(items[this.wrongCursor].index + 1);
+                this.wrongMode = false;
+              }
+            } else return;
+            redraw();
+            return;
+          }
+
+          // 闪卡复习模态：enter 翻面 / 翻面后 enter 记一次复习并下一张 / esc 退出
+          if (this.cardMode) {
+            if (key === 'escape') {
+              this.cardMode = false;
+              redraw();
               return;
             }
             if (data === '\r' || data === '\n') {
-              if (!this.memoryCardFlipped) {
-                this.memoryCardFlipped = true;
+              if (!this.cardFlipped) {
+                this.cardFlipped = true;
               } else {
-                this.memoryCard = undefined;
+                const card = this.cardDeck[this.cardCursor];
+                if (card) this.cards?.markReviewed(card.exerId);
+                this.cardCursor += 1;
+                this.cardFlipped = false;
+                if (this.cardCursor >= this.cardDeck.length) {
+                  this.cardMode = false;
+                  setStatus('本轮闪卡复习完成', 'success');
+                }
               }
-              tui.requestRender();
+              redraw();
               return;
+            }
+            return;
+          }
+
+          // AI 追问面板模态：直接打字，enter 发送，esc 返回答题（优先于退出对话框）
+          if (this.chatMode) {
+            if (key === 'escape') {
+              this.chatMode = false;
+              inputFocused = false;
+              buffer = '';
+              redraw();
+              return;
+            }
+            if (this.chatBusy) return; // 思考中不接受输入，避免乱序
+            if (data === '\r' || data === '\n') {
+              submitChat();
+            } else if (key === 'c') {
+              // 面板内按 C：无卡时提示（有卡时已被上方记忆卡模态接管）
+              setStatus('暂无记忆卡：AI 回答含【记忆卡】时自动生成', 'info');
+            } else if (data === '\x7f' || data === '\b') {
+              const chars = Array.from(buffer);
+              buffer = chars.slice(0, -1).join('');
+              tui.requestRender();
+            } else if (data === '\x15') {
+              buffer = '';
+              tui.requestRender();
+            } else if (data === '\x03') {
+              this.cache.saveSession(this.session);
+              finish();
+            } else if (data.startsWith('\x1b')) {
+              return; // 方向键等序列忽略
+            } else if (data >= ' ') {
+              buffer += data;
+              tui.requestRender();
             }
             return;
           }
@@ -1109,17 +1317,33 @@ export class ExerciseTUI {
             openExitDialog();
           } else if (key === 't' && current && this.onAiTutor) {
             void run(() => this.onAiTutor!(current, 'hint'));
-          } else if (key === 'f' && current && this.onAiTutor) {
-            // F：快速问 AI（输入问题 → LLM 回答，可能附带记忆卡）
-            void run(() => this.onAiTutor!(current, 'flashcard'));
-          } else if (key === 'c' && this.memoryCard) {
-            // C：翻看 AI 生成的记忆卡
-            if (!this.memoryCardFlipped) {
-              this.memoryCardFlipped = true;
-            } else {
-              this.memoryCard = undefined;
-            }
-            tui.requestRender();
+          } else if (key === 'f' && current && this.onChatAsk) {
+            // F：进入 AI 追问面板（多轮对话）
+            openChat();
+          } else if (key === 'w' && this.wrongItems().length) {
+            // W：错题集中回顾
+            this.wrongMode = true;
+            this.wrongCursor = 0;
+            redraw();
+          } else if (key === 'k') {
+            // K：闪卡抽卡复习
+            if (!this.openCardReview()) setStatus('闪卡集为空：答错题目后按 Y 加入闪卡', 'info');
+            redraw();
+          } else if (key === 'y' && current && current.doResult === -1 && this.onAddCard) {
+            // Y：答错后确认，AI 组卡入集（相似错题 = 本 session 其他错题）
+            const cardCtx = {
+              siblingTitles: this.session.exercises
+                .filter((e) => e.doResult === -1 && e !== current && e.title)
+                .map((e) => e.title),
+              courseId: this.session.courseId,
+              chapterName: this.session.chapterName,
+            };
+            void run(async () => {
+              setStatus('正在生成闪卡...', 'busy', 0);
+              const message = await this.onAddCard!(current, cardCtx);
+              if (message) setStatus(message, 'success');
+              else setStatus('闪卡生成失败（AI 未返回有效内容）', 'error', 6000);
+            });
           } else if (['a', 'b', 'c', 'd', 'e'].includes(key)) {
             this.selectAnswer(key.toUpperCase());
             answerFeedback();
@@ -1160,12 +1384,7 @@ export class ExerciseTUI {
     });
   }
 
-  /** 记录 AI 回答：提取记忆卡供 C 键查看 */
-  public setLastAiAnswer(answer: string): void {
-    const { card } = extractMemoryCard(answer);
-    this.memoryCard = card;
-    this.memoryCardFlipped = false;
-  }
+
 
   /**
    * 启动 TUI 交互监听

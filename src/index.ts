@@ -3,14 +3,15 @@ import { CourseListItem, KaodesClient, ProductItem } from './api/client.js';
 import { SessionCache } from './cache/session.js';
 import { Preferences } from './config/preferences.js';
 import { buildStatsReport } from './stats/report.js';
-import { ExerciseTUI, KAODES_HELP } from './tui/exercise.js';
-import { parseHighlightBlock, parseLooseHighlight } from './tui/highlight.js';
+import { ExerciseTUI, KAODES_HELP, extractMemoryCard } from './tui/exercise.js';
+import { FlashcardStore } from './cards/store.js';
+import { parseHighlightBlock, parseLooseHighlight, paintAiAnswer, marksForAnswer, stripMd } from './tui/highlight.js';
 import { PAGED_SELECT_BACK, pagedSelect } from './tui/pagedSelect.js';
 import { AiTutorEngine } from './tutor/engine.js';
-import { ChapterPracticeNode, PracticeSession } from './types.js';
+import { ChapterPracticeNode, ChatTurn, PracticeSession } from './types.js';
 
 /** 插件版本号，需与 package.json 的 version 保持一致。 */
-export const PLUGIN_VERSION = '1.2.0';
+export const PLUGIN_VERSION = '1.3.0';
 
 /** 当前加载的构建目录（dist 绝对路径），用于让用户确认加载的是新构建。 */
 function loadedBuildDir(): string {
@@ -35,6 +36,16 @@ function stripHighlightBlock(text: string): string {
   const next = rest.indexOf('【');
   const tail = next >= 0 ? rest.slice(next) : '';
   return (text.slice(0, at) + tail).replace(/\s+$/, '');
+}
+
+/**
+ * 给 AI 回复上色：规则词典 + 当前题缓存的 LLM 考点词合成区间后注 ANSI。
+ * 与题目区共用同一套高亮引擎，视觉语义一致（黄=题眼，红=易错，绿=结论）。
+ */
+function paintAiText(text: string, exer: import('./types.js').ExerciseItem): string {
+  // 只标 LLM 考点词（首现 + 封顶），规则词典扫长回答会把文本刷成彩虹；先剥 markdown 星号再定位词
+  const plain = stripMd(text);
+  return paintAiAnswer(plain, marksForAnswer(plain, exer.llmMarks));
 }
 
 export interface PiComponent {
@@ -100,15 +111,16 @@ export class KaodesExtension {
   /** Pi 宿主注入的 LLM 通道（initKaodesExtension 时透传） */
   public piModelRegistry?: PiCommandContext['modelRegistry'];
   public piModel?: unknown;
-  /** 最近一次 AI 回答原文（供 TUI 提取记忆卡） */
-  private lastAiAnswer?: string;
+  /** 闪卡集：答错入卡 + K 抽卡复习，持久化到 ~/.pi/kaodes-flashcards.json */
+  public cards: FlashcardStore;
 
-  constructor(options?: { configPath?: string; cacheDir?: string; prefsPath?: string }) {
+  constructor(options?: { configPath?: string; cacheDir?: string; prefsPath?: string; cardsPath?: string }) {
     this.auth = new AuthManager(options?.configPath);
     this.client = new KaodesClient(this.auth);
     this.cache = new SessionCache(options?.cacheDir);
     this.tutor = new AiTutorEngine();
     this.prefs = new Preferences(options?.prefsPath);
+    this.cards = new FlashcardStore(options?.cardsPath);
   }
 
   /**
@@ -125,6 +137,7 @@ export class KaodesExtension {
       {
         highlightEnabled: this.prefs.highlightEnabled,
         onHighlightChange: (on) => this.prefs.setHighlightEnabled(on),
+        cards: this.cards,
       }
     );
   }
@@ -521,8 +534,12 @@ export class KaodesExtension {
     await this.runTui(tui, commandContext);
   }
 
-  /** 调用 Pi 当前会话 LLM；不可用时返回 null */
-  private async askPiLLM(commandContext: PiCommandContext, prompt: string): Promise<string | null> {
+  /** 调用 Pi 当前会话 LLM；不可用时返回 null。priorMessages 为追问历史（不含本次提问）。 */
+  private async askPiLLM(
+    commandContext: PiCommandContext,
+    prompt: string,
+    priorMessages?: ChatTurn[]
+  ): Promise<string | null> {
     const registry = commandContext.modelRegistry as
       | { complete(model: unknown, context: unknown): Promise<{ content?: Array<{ type: string; text?: string }>; errorMessage?: string }> }
       | undefined;
@@ -532,68 +549,96 @@ export class KaodesExtension {
       const message = (await registry.complete(model, {
         systemPrompt:
           '你是备考伴学导师。回答学员关于当前题目的问题，简练准确。' +
-          '若回答的知识点值得记忆，在回答末尾追加一张记忆卡，格式严格为：\n【记忆卡】\n【问】<一句话反问>\n【要点】<1-3 句要点>\n若不值得记忆则不加记忆卡。\n' +
-          '另外，请在回答最末尾追加一行高亮标注，用于在题干/选项上标出考点，格式严格为：\n' +
+          '请在回答最末尾追加一行高亮标注，用于在题干/选项上标出考点，格式严格为：\n' +
           '【高亮】题眼:<考点词,逗号分隔>;易错:<否定或陷阱词>;结论:<结论落点词>\n' +
           '只填当前题目原文里确实出现的词，每类可留空，词长 2-12 字，不要编造。',
-        messages: [{ role: 'user', content: prompt, timestamp: Date.now() }],
+        messages: [
+          ...(priorMessages ?? []).map((turn) => ({
+            role: turn.role,
+            // pi 要求 assistant 消息的 content 是 block 数组，字符串会让宿主 transformMessages 崩溃
+            content:
+              turn.role === 'assistant'
+                ? [{ type: 'text', text: turn.content }]
+                : turn.content,
+            timestamp: Date.now(),
+          })),
+          { role: 'user', content: prompt, timestamp: Date.now() },
+        ],
       })) as { content?: Array<{ type: string; text?: string }>; errorMessage?: string };
-      if (message?.errorMessage) return null;
+      if (message?.errorMessage) throw new Error(message.errorMessage);
       const text = (message?.content || [])
         .filter((block) => block.type === 'text' && block.text)
         .map((block) => block.text)
         .join('')
         .trim();
       return text || null;
-    } catch {
-      return null;
+    } catch (error) {
+      // 不吞错误：调用方（T 键 run 包装 / 对话面板 submitChat）会把具体原因显示到状态栏
+      throw new Error(error instanceof Error ? error.message : String(error));
     }
   }
 
   /**
-   * 快速问 AI：输入问题 → LLM 回答；回答含【记忆卡】时提示按 C 查看。
-   * AI 回答里若带【高亮】块，则顺带把考点词缓存到当前题（第二阶段 LLM 高亮，零额外调用）。
-   * 若主回答未返回【高亮】，会触发一次轻量兜底抽取（额外 token）。
+   * AI 一键点拨（T）：分析当前题不剧透，结论同时进入本题对话历史，
+   * 之后按 F 追问时 AI 能接着上文继续说。
    */
   private async tutorInPi(
     exer: import('./types.js').ExerciseItem,
-    mode: 'hint' | 'flashcard',
     commandContext: PiCommandContext
   ): Promise<void> {
-    if (mode === 'hint') {
-      // 一键点拨：直接让 AI 分析当前题（不剧透答案）
-      const raw = await this.askPiLLM(commandContext, this.tutor.buildHintPrompt(exer));
-      await this.applyLlmHighlight(exer, raw, commandContext);
-      const hint = raw ? stripHighlightBlock(raw) : null;
-      commandContext.ui.notify(hint || this.tutor.generateFallbackHint(exer), 'info');
-      return;
-    }
-
-    // 快速提问：先收问题（预填题目上下文提示），再调 LLM
-    const question = await commandContext.ui.input(
-      '问 AI（关于当前题目）:',
-      '如：这道题的 B 选项为什么不对？'
-    );
-    if (question === undefined || !question.trim()) return;
-
-    const context = `【当前题目】${exer.title}\n${
-      exer.a ? `A. ${exer.a}\n` : ''
-    }${exer.b ? `B. ${exer.b}\n` : ''}${exer.c ? `C. ${exer.c}\n` : ''}${
-      exer.d ? `D. ${exer.d}\n` : ''
-    }${exer.userKey ? `【我的作答】${exer.userKey}\n` : ''}\n【我的问题】${question.trim()}`;
-
-    const raw = await this.askPiLLM(commandContext, context);
-    if (!raw) {
-      commandContext.ui.notify('AI 暂不可用（无可用模型或调用失败），可稍后重试。', 'warning');
-      return;
-    }
+    // 一键点拨：直接让 AI 分析当前题（不剧透答案）
+    const raw = await this.askPiLLM(commandContext, this.tutor.buildHintPrompt(exer));
     await this.applyLlmHighlight(exer, raw, commandContext);
-    const answer = stripHighlightBlock(raw);
-    this.lastAiAnswer = answer;
-    commandContext.ui.notify(answer, 'info');
-    if (answer.includes('【记忆卡】')) {
-      commandContext.ui.notify('AI 为你生成了一张记忆卡，按 C 键查看。', 'success');
-    }
+    const hint = raw ? stripHighlightBlock(raw) : null;
+    // 思路点拨也套用同一套考点高亮，与题目区视觉一致
+    const hintText = hint || this.tutor.generateFallbackHint(exer);
+    commandContext.ui.notify(paintAiText(hintText, exer), 'info');
+    // 点拨结论进对话历史（内存），随下次 session 保存持久化
+    (exer.chatHistory ??= []).push({ role: 'assistant', content: hintText });
+  }
+
+  /** 首问 prompt：题目上下文 + 问题；追问时历史已含上下文，只发问题本身。 */
+  private buildQuestionContext(exer: import('./types.js').ExerciseItem, question: string): string {
+    return `【当前题目】${exer.title}
+${
+      exer.a ? `A. ${exer.a}
+` : ''
+    }${exer.b ? `B. ${exer.b}
+` : ''}${exer.c ? `C. ${exer.c}
+` : ''}${
+      exer.d ? `D. ${exer.d}
+` : ''
+    }${exer.userKey ? `【我的作答】${exer.userKey}
+` : ''}
+【我的问题】${question.trim()}`;
+  }
+
+  /** 入卡集上下文：相似错题线索 + 归属信息（由 TUI 从当前 session 取）。 */
+  public async addCardWithLLM(
+    exer: import('./types.js').ExerciseItem,
+    cardCtx: { siblingTitles: string[]; courseId: string; chapterName?: string },
+    commandContext: PiCommandContext
+  ): Promise<string | null> {
+    // 该题已有的累计错误次数 + 本次（提示词里让 AI 知道错了几次，≥2 次会重点覆盖易错辨析）
+    const wrongCount = (this.cards.findByExerId(exer.exerId)?.wrongCount ?? 0) + 1;
+    const raw = await this.askPiLLM(
+      commandContext,
+      this.tutor.buildCardPrompt(exer, wrongCount, cardCtx.siblingTitles)
+    );
+    if (!raw) return null;
+    const match = raw.match(/【问题】\s*([\s\S]*?)【要点】\s*([\s\S]*?)$/);
+    if (!match || !match[1].trim()) return null;
+    this.cards.upsert(
+      {
+        exerId: exer.exerId,
+        question: match[1].trim(),
+        keyPoints: match[2].trim(),
+        courseId: cardCtx.courseId,
+        chapterName: cardCtx.chapterName,
+      },
+      Date.now()
+    );
+    return `已加入闪卡集 · 该题累计错 ${wrongCount} 次（按 K 复习）`;
   }
 
   /**
@@ -672,12 +717,19 @@ export class KaodesExtension {
         commandContext.model = this.piModel;
       }
       tui.setOnAiTutor(async (exer, mode) => {
-        await this.tutorInPi(exer, mode, commandContext);
-        // AI 回答后把记忆卡同步给 TUI（C 键查看）
-        if (this.lastAiAnswer) {
-          tui.setLastAiAnswer(this.lastAiAnswer);
-          this.lastAiAnswer = undefined;
-        }
+        await this.tutorInPi(exer, commandContext);
+      });
+      // AI 追问面板：多轮历史直通 LLM；首问拼题目上下文，追问只发新问题
+      tui.setOnChatAsk(async (exer, history, question) => {
+        const prompt = history.length ? question : this.buildQuestionContext(exer, question);
+        const raw = await this.askPiLLM(commandContext, prompt, history);
+        if (!raw) return null;
+        await this.applyLlmHighlight(exer, raw, commandContext);
+        return stripHighlightBlock(raw);
+      });
+      // 答错按 Y：AI 结合错误次数与相似错题组卡入集
+      tui.setOnAddCard(async (exer, cardCtx) => {
+        return this.addCardWithLLM(exer, cardCtx, commandContext);
       });
       await tui.startInPi(commandContext.ui);
       return;

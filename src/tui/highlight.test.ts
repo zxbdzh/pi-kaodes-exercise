@@ -1,11 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  applyAnsiMarks,
   commonPrefixLength,
   findMarks,
   markColor,
   marksFromTerms,
   mergeMarks,
+  marksForAnswer,
+  paintAiAnswer,
   parseHighlightBlock,
 } from './highlight.js';
 
@@ -89,3 +92,43 @@ test('mergeMarks - 重叠处以 LLM 为准，其余取并集', () => {
   assert.deepEqual(mergeMarks(rule, []), rule);
 });
 
+
+test('applyAnsiMarks / paintAiAnswer - 考点词注入 ANSI，标签上青色', () => {
+  const text = '【要点】因此三者缺一不可，根本在于统一。';
+  const marks = findMarks(text);
+  const out = applyAnsiMarks(text, marks);
+  // 纯文本内容不变，但含高亮 ANSI
+  assert.ok(out.includes('\x1b[32m因此\x1b[0m'));
+  assert.ok(out.includes('\x1b[33m根本\x1b[0m'));
+  // paintAiAnswer 再给【要点】标签上青色
+  const painted = paintAiAnswer(text, marks);
+  assert.ok(painted.includes('\x1b[36m【要点】\x1b[0m'));
+  // 宽度计算不受 ANSI 影响（视觉宽度等于纯文本长度）
+  assert.equal(stripAnsiForTest(painted), text);
+  // 无 marks 时原样返回
+  assert.equal(applyAnsiMarks('abc', []), 'abc');
+});
+
+function stripAnsiForTest(s: string): string {
+  return s.replace(/\x1b\[[0-9;]*m/g, '');
+}
+
+test('marksForAnswer - 只标 LLM 词、每词首现、总数封顶', () => {
+  const text = '世界观是根本认知。世界观决定人生。根本在于实践。';
+  const marks = marksForAnswer(text, [
+    { term: '世界观', kind: 'key' },
+    { term: '根本', kind: 'key' },
+    { term: '人生', kind: 'warn' },
+  ]);
+  // 世界观出现 2 次只标首现
+  assert.equal(marks.filter((m) => m.kind === 'key' && m.start === 0).length, 1);
+  assert.ok(!marks.some((m) => m.start === 9));
+  // 无 LLM 词时为空（不再回落规则词典刷彩虹）
+  assert.deepEqual(marksForAnswer(text, undefined), []);
+  // 封顶：4 个词只留前 4 个
+  const many = marksForAnswer('甲乙丙丁戊己', [
+    { term: '甲', kind: 'key' }, { term: '乙', kind: 'key' }, { term: '丙', kind: 'key' },
+    { term: '丁', kind: 'key' }, { term: '戊', kind: 'key' }, { term: '己', kind: 'key' },
+  ]);
+  assert.equal(many.length, 4);
+});

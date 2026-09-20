@@ -84,6 +84,33 @@ ${context}
   }
 
   /**
+   * 生成入集闪卡 Prompt：答错确认后调用。
+   * 结合本题累计错误次数与本 session 内其他错题（相似题线索），
+   * 生成可直接入闪卡集的问答对；输出格式与反问卡一致（【问题】【要点】）。
+   */
+  public buildCardPrompt(exer: ExerciseItem, wrongCount: number, siblingTitles: string[]): string {
+    let context = `【题目】${exer.title}\n`;
+    if (exer.a) context += `A. ${exer.a}\n`;
+    if (exer.b) context += `B. ${exer.b}\n`;
+    if (exer.c) context += `C. ${exer.c}\n`;
+    if (exer.d) context += `D. ${exer.d}\n`;
+
+    const siblings = siblingTitles.length
+      ? `【本组其他错题】${siblingTitles.slice(0, 3).join('；')}\n（若与本题考点相关，可在要点中一并对比说明）\n`
+      : '';
+
+    return `你是备考伴学导师。学员在下面这道题上已答错 ${wrongCount} 次，请把它的核心考点做成一张闪卡加入复习集：
+${context}${siblings}
+【参考解析】${exer.analyze || '无'}
+
+【要求】
+1. 问题直击本题考点，若错误次数多（≥2 次）则覆盖易错辨析；
+2. 严格按以下格式输出，不要输出其他内容：
+【问题】<一句话反问>
+【要点】<1-3 句要点，可含正确方向但不直接抄解析>`;
+  }
+
+  /**
    * 生成简答点评 Prompt
    */
   public buildReviewPrompt(exer: ExerciseItem, question: string, userAnswer: string, keyPoints: string): string {
