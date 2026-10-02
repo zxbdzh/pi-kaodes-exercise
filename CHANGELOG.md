@@ -9,6 +9,10 @@
 - **错题本移出（X / `:drop`）**：`/kaodes wrong` 里按 `X` 把当前题移出本机名单（`~/.pi/kaodes-wrong-removed.json`），下次不再出现。W 回顾列表同样可用。不调用云端 `removeWrong`（`type=0/2` 会清空整本）。
 - **Esc 退出菜单可交卷**：增加「交卷并退出」，与 Q / `:submit` 同一条提交路径。
 
+### 修复
+
+- **插件入口改为源码，不再依赖构建产物**：`pi.extensions` 由 `./dist/index.js` 改为 `./src/index.ts`（Pi 用 jiti 直接加载 TS，无构建步骤）。此前 Pi 更新 git 包时会清掉未跟踪的 `dist/` 与 `node_modules/`，入口文件随之消失，`/kaodes` 完全无响应。
+
 ## [1.3.0] - 2026-09-19
 
 ### 新增

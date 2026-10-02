@@ -17,7 +17,7 @@ import { ChapterPracticeNode, ChatTurn, ExerciseItem, PracticeSession } from './
 /** 插件版本号，需与 package.json 的 version 保持一致。 */
 export const PLUGIN_VERSION = '1.3.0';
 
-/** 当前加载的构建目录（dist 绝对路径），用于让用户确认加载的是新构建。 */
+/** 当前加载的源码目录（Pi 用 jiti 直接加载 TS，无构建步骤），用于让用户确认加载的是哪份代码。 */
 function loadedBuildDir(): string {
   try {
     // eslint-disable-next-line @typescript-eslint/no-var-requires

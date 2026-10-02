@@ -22,36 +22,35 @@
 
 ## 🚀 快速安装与配置
 
-### 1. 安装与构建
+### 1. 安装
+
+Pi 用 jiti 直接加载 TypeScript 源码，**没有构建步骤**：
+
 ```bash
 cd F:/github/pi-kaodes-exercise
-npm install
-npm run build
+npm install   # 可选，只有跑测试才需要
 ```
 
 ### 2. 在 Pi 中加载扩展
 
-先构建，再直接加载编译后的扩展入口：
+直接加载源码入口：
+
 ```bash
-cd F:/github/pi-kaodes-exercise
-npm run build
-pi --extension F:/github/pi-kaodes-exercise/dist/index.js
+pi --extension F:/github/pi-kaodes-exercise/src/index.ts
 ```
 
-也可以在 Pi 启动后通过本地扩展安装机制加载项目目录；为了避免加载到旧的 `dist`，每次改源码后先执行 `npm run build`。
+也可以在 Pi 启动后通过本地扩展安装机制加载项目目录（把该目录加进 `~/.pi/agent/settings.json` 的 `packages`），之后每次启动自动加载。
 
-> **确认加载的是新构建**：进入 Pi 后执行 `/kaodes version`，会显示插件版本号与当前加载的 `dist` 构建目录。
-> 若功能表现与文档不符（例如高亮看不见、翻页无效），多半是加载了旧构建：重新 `npm run build`，或用 `pi --extension F:/github/pi-kaodes-exercise/dist/index.js` 直接指向最新产物再启动。
+> **确认加载的是哪份代码**：进入 Pi 后执行 `/kaodes version`，会显示插件版本号与当前加载的源码目录。
 
 ### 2.1 更新到新版本
+
 ```bash
 cd F:/github/pi-kaodes-exercise
 git pull
-npm install
-npm run build
-# 若通过 Pi 本地扩展安装机制加载，请重新安装/刷新扩展，使其指向新的 dist
 ```
-更新后再次运行 `/kaodes version` 核对版本号即可。
+
+然后重启 Pi。`dist/` 和 `node_modules/` 被 Pi 的包更新流程清掉也不影响运行 —— 插件加载的是 `src/`。更新后运行 `/kaodes version` 核对版本号。
 
 ### 3. 配置与更新 Token
 
