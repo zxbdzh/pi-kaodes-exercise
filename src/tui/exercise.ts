@@ -5,6 +5,8 @@ import { ExerciseItem, PracticeSession, ChatTurn } from '../types.js';
 import { KaodesClient } from '../api/client.js';
 import { SessionCache } from '../cache/session.js';
 import { Flashcard, FlashcardStore } from '../cards/store.js';
+import { WrongRemovedStore } from '../cache/wrongRemoved.js';
+import { MASTER_STREAK, WrongBookStore, chapterOf } from '../cache/wrongBook.js';
 
 export type OnAiTutorCallback = (exer: ExerciseItem, mode: 'hint' | 'flashcard') => Promise<void>;
 
@@ -109,7 +111,9 @@ export const KAODES_HELP = [
   '  K              闪卡抽卡复习（错得多 / 久未复习优先，enter 翻面）',
   '  Y              答错后按 Y，AI 组卡加入闪卡集',
   '  W              错题回顾（↑↓ 选择，enter 跳到该题）',
-  '  Esc            退出对话框（↑↓ 选择 · Enter 确认 · Esc 继续答题）',
+  '  X              移出当前题（仅错题本，写入本机名单，下次不再出现）',
+  '  M              错题本：把当前题标为已掌握',
+  '  Esc            退出对话框（保存 / 交卷 / 不保存 / 继续）',
   '  Ctrl+C         保存并退出',
   '',
   '答题页底部指令（按 : 或 / 聚焦输入框，Enter 提交，Esc 取消）:',
@@ -125,6 +129,8 @@ export const KAODES_HELP = [
   '  ask | f                 AI 追问面板（多轮对话）',
   '  card | k                闪卡抽卡复习',
   '  wrong | w               错题集中回顾',
+  '  drop | x               移出当前题（仅错题本）',
+  '  master | m             错题本：标为已掌握',
   '  hl [on|off]             规则高亮开关',
   '  hll                     手动触发 LLM 考点抽取（额外 token）',
   '  exit [save|discard]     退出（可指定保存 / 不保存）',
@@ -133,6 +139,12 @@ export const KAODES_HELP = [
   '  题眼定位词（根本/本质/关键…）= 黄 · 否定设问（错误的是/不属于…）= 红',
   '  解析结论词（因此/由此可见…）= 绿 · 选项公共前缀 = 灰（只留差异）',
   '  按 T 点拨 / F 问 AI 后，AI 会顺带标出本题考点（LLM 高亮，缓存本题、离线可复现）',
+  '',
+  '错题本列表（/kaodes wrong）:',
+  '  首行是题量、待复习、已掌握',
+  '  F 筛选  S 排序  C 章节  V 错因  Enter 练习当前筛选',
+  '  G 只重练当前题  M 标掌握  R 恢复  X 移出待攻克',
+  '  连续做对 2 次后可 M 标掌握，做错会清零并提高优先级',
   '',
   '底栏说明:',
   '  session 行紧凑展示进度 · 章节 · 科目；执行中 / 成功 / 错误等临时状态',
@@ -315,6 +327,11 @@ export class ExerciseTUI {
   private cardCursor = 0;
   private cardFlipped = false;
   private cards?: FlashcardStore;
+  /** 错题本移出名单；仅 /kaodes wrong 会话写入 */
+  private removed?: WrongRemovedStore;
+  /** 错题本次数 / 连续做对 / 掌握。非错题本会话不写。 */
+  private book?: WrongBookStore;
+  private coachNote = '';
   /** 错题回顾模式：w 键 / :wrong 进入，主区域列出本 session 全部错题 */
   private wrongMode = false;
   private wrongCursor = 0;
@@ -336,6 +353,8 @@ export class ExerciseTUI {
       onHighlightChange?: (on: boolean) => void;
       /** 闪卡集存储（K 抽卡复习数据源）；缺省时 K 键提示不可用 */
       cards?: FlashcardStore;
+      removed?: WrongRemovedStore;
+      book?: WrongBookStore;
     }
   ) {
     this.session = session;
@@ -343,6 +362,8 @@ export class ExerciseTUI {
     this.cache = cache;
     this.onAiTutor = onAiTutor;
     this.cards = options?.cards;
+    this.removed = options?.removed;
+    this.book = options?.book;
     if (options?.highlightEnabled !== undefined) this.highlightEnabled = options.highlightEnabled;
     this.onHighlightChange = options?.onHighlightChange;
   }
@@ -560,7 +581,7 @@ export class ExerciseTUI {
       });
     });
     lines.push({ text: '', color: 'text' });
-    lines.push({ text: '↑↓ 选择 · enter 跳到该题 · esc 返回答题', color: 'muted' });
+    lines.push({ text: '↑↓ 选择 · enter 跳到该题 · X 移出 · esc 返回答题', color: 'muted' });
     return lines;
   }
 
@@ -595,6 +616,8 @@ export class ExerciseTUI {
   public selectAnswer(ansKey: string): void {
     const cur = this.session.exercises[this.session.currentIndex];
     if (!cur) return;
+    const before = cur.doResult;
+    const prevKey = cur.userKey || null;
 
     if (cur.newKeyType === 2) {
       // 多选题：可累加/反选
@@ -612,6 +635,48 @@ export class ExerciseTUI {
       }
     }
     this.cache.saveSession(this.session);
+    this.rememberWrongBook(cur, before, prevKey);
+    if (this.isWrongBook()) void this.saveProgress();
+  }
+
+  public takeCoachNote(): string {
+    const note = this.coachNote;
+    this.coachNote = '';
+    return note;
+  }
+
+  /** 仅错题本记账。失败不影响作答，其他模式直接跳过。 */
+  private rememberWrongBook(cur: ExerciseItem, before: number | undefined, prevKey: string | null): void {
+    if (!this.book || !this.isWrongBook() || cur.newKeyType === 2) return;
+    if (cur.doResult === before && (cur.userKey || null) === prevKey) return;
+    const exerId = Number(cur.exerId || cur.exerID || 0);
+    if (!exerId) return;
+    try {
+      if (cur.doResult === 1) {
+        const meta = this.book.noteCorrect(this.session.courseId, exerId);
+        this.coachNote = meta.streak >= MASTER_STREAK
+          ? `连续做对 ${meta.streak} 次。M 标掌握，X 移出待攻克`
+          : `连续做对 ${meta.streak} 次`;
+      } else if (cur.doResult === -1) {
+        const meta = this.book.noteWrong(this.session.courseId, exerId, chapterOf(cur, this.session.chapterName), cur.userKey);
+        this.coachNote = `已重新计入 · 错 ${meta.wrongCount} 次 · 优先级 ${meta.priority}`;
+      }
+    } catch {
+      // 错题本记账失败不影响作答
+    }
+  }
+
+  public markCurrentMastered(): string {
+    if (!this.isWrongBook() || !this.book) return '仅错题本可标掌握';
+    const cur = this.session.exercises[this.session.currentIndex];
+    const exerId = Number(cur?.exerId || cur?.exerID || 0);
+    if (!exerId) return '当前无题目';
+    try {
+      this.book.markMastered(this.session.courseId, exerId);
+    } catch {
+      return '标掌握失败';
+    }
+    return '已标为掌握。本轮还能继续做，下次默认不再待复习。';
   }
 
   public setOnAiTutor(callback: OnAiTutorCallback): void {
@@ -634,6 +699,28 @@ export class ExerciseTUI {
     this.cardFlipped = false;
     this.cardMode = true;
     return true;
+  }
+
+  /** 从本局错题本移出一题，写入本机名单。不调云端 removeWrong。 */
+  public removeWrongAt(index: number): 'ok' | 'empty' | 'skip' {
+    if (!this.isWrongBook()) return 'skip';
+    const item = this.session.exercises[index];
+    if (!item) return 'skip';
+    const exerId = Number(item.exerId || item.exerID || 0);
+    if (exerId) this.removed?.add(this.session.courseId, exerId);
+    this.session.exercises.splice(index, 1);
+    if (this.session.currentIndex > index) this.session.currentIndex -= 1;
+    if (this.session.currentIndex >= this.session.exercises.length) {
+      this.session.currentIndex = Math.max(0, this.session.exercises.length - 1);
+    }
+    this.optionCursor = 0;
+    if (!this.session.exercises.length) {
+      this.cache.clearSession(this.session.courseId, this.session.catId || 'default');
+      return 'empty';
+    }
+    this.cache.saveSession(this.session);
+    void this.saveProgress();
+    return 'ok';
   }
 
   /** 规则高亮开关：on 开启 / off 关闭，返回当前状态。 */
@@ -710,12 +797,73 @@ export class ExerciseTUI {
     };
   }
 
+  /** 章节练习的 prId 是服务端 int；daily 用 Date.now() 当 prId 会撑爆 Java Integer。 */
+  private canSyncCloud(): boolean {
+    const prId = this.session.prId;
+    return Number.isInteger(prId) && prId > 0 && prId <= 2147483647;
+  }
+
+  private isWrongBook(): boolean {
+    return this.session.catId === 'wrong' && /^[1-9]\d*$/.test(this.session.courseId);
+  }
+
+  private wrongPayload(isFinish: number) {
+    return {
+      courseId: this.session.courseId,
+      isFinish,
+      lastPosition: this.session.currentIndex + 1,
+      exercises: this.session.exercises.map((item) => ({
+        exerID: item.exerId || item.exerID || 0,
+        score: 0,
+        starCount: item.starCount || 0,
+        userKey: item.userKey || '',
+        userKeyImg1: '',
+        userKeyImg2: '',
+        userKeyImg3: '',
+        sonExer: [],
+      })),
+    };
+  }
+
+  private localSubmitResult() {
+    const list = this.session.exercises;
+    const correctNum = list.filter((item) => item.doResult === 1).length;
+    const errorNum = list.filter((item) => item.doResult === -1).length;
+    const exerNum = list.length;
+    return {
+      code: 200,
+      flag: true,
+      message: 'ok',
+      data: {
+        correctNum,
+        errorNum,
+        exerNum,
+        correctRate: exerNum ? `${Math.round((correctNum / exerNum) * 100)}%` : '0%',
+        createDate: new Date().toISOString(),
+      },
+    };
+  }
+
   public async saveProgress(): Promise<void> {
     this.cache.saveSession(this.session);
+    if (this.isWrongBook()) {
+      await this.client.submitWrongStore(this.wrongPayload(0));
+      return;
+    }
+    if (!this.canSyncCloud()) return;
     await this.client.savePractice(this.practicePayload());
   }
 
   public async submitProgress(): Promise<ReturnType<KaodesClient['submitPractice']> extends Promise<infer T> ? T : never> {
+    if (this.isWrongBook()) {
+      const response = await this.client.submitWrongStore(this.wrongPayload(1));
+      this.cache.clearSession(this.session.courseId, this.session.catId || 'default');
+      return response;
+    }
+    if (!this.canSyncCloud()) {
+      this.cache.clearSession(this.session.courseId, this.session.catId || 'default');
+      return this.localSubmitResult();
+    }
     const response = await this.client.submitPractice(this.practicePayload());
     await Promise.allSettled(
       this.session.exercises
@@ -907,15 +1055,16 @@ export class ExerciseTUI {
         if (cur.newKeyType === 2) {
           setStatus(cur.userKey ? `已选 ${cur.userKey}` : '已清空选择', 'info');
         } else if (cur.doResult === 1) {
-          setStatus('回答正确', 'success');
+          setStatus(this.takeCoachNote() || '回答正确', 'success');
         } else if (cur.doResult === -1) {
-          setStatus(this.onAddCard ? '回答错误 · 按 Y 加入闪卡集' : '回答错误', 'error');
+          const note = this.takeCoachNote();
+          setStatus(note || (this.onAddCard ? '回答错误 · 按 Y 加入闪卡集' : '回答错误'), 'error');
         }
       };
 
       // 退出对话框在组件内自绘：Pi 的 ui.select 无法叠加在 custom 组件之上，
       // 嵌套调用会因 Promise 永不 resolve 导致 busy 卡死（按键全部失效）。
-      const EXIT_OPTIONS = ['保存断点并退出', '不保存退出', '继续答题'];
+      const EXIT_OPTIONS = ['保存断点并退出', '交卷并退出', '不保存退出', '继续答题'] as const;
       let exitOpen = false;
       let exitCursor = 0;
 
@@ -951,6 +1100,22 @@ export class ExerciseTUI {
           );
           finish();
         });
+      };
+
+      const applyRemove = (index: number): void => {
+        const result = this.removeWrongAt(index);
+        if (result === 'skip') {
+          setStatus('仅错题本可移出', 'info');
+          return;
+        }
+        if (result === 'empty') {
+          ui.notify('错题本已空', 'info');
+          finish();
+          return;
+        }
+        const left = this.session.exercises.length;
+        setStatus(`已移出 · 剩 ${left} 道`, 'success');
+        redraw();
       };
 
       const executeCommand = (raw: string): void => {
@@ -1084,6 +1249,16 @@ export class ExerciseTUI {
             redraw();
             return;
           }
+          case 'drop':
+          case 'x': {
+            applyRemove(this.session.currentIndex);
+            return;
+          }
+          case 'master':
+          case 'm': {
+            setStatus(this.markCurrentMastered(), 'success');
+            return;
+          }
           case 'card':
           case 'k': {
             // 闪卡复习：按优先级抽卡（错得多 / 久未复习优先）
@@ -1095,8 +1270,15 @@ export class ExerciseTUI {
           case 'quit':
           case 'esc': {
             if (arg === 'save') {
-              this.cache.saveSession(this.session);
-              finish();
+              if (this.isWrongBook()) {
+                void run(async () => {
+                  await this.saveProgress();
+                  finish();
+                });
+              } else {
+                this.cache.saveSession(this.session);
+                finish();
+              }
             } else if (arg === 'discard') {
               this.cache.clearSession(this.session.courseId, this.session.catId || 'default');
               finish();
@@ -1178,12 +1360,24 @@ export class ExerciseTUI {
             if (key === 'up' || key === 'k') exitCursor = Math.max(0, exitCursor - 1);
             else if (key === 'down' || key === 'j') exitCursor = Math.min(EXIT_OPTIONS.length - 1, exitCursor + 1);
             else if (key === 'enter') {
-              if (exitCursor === 0) {
-                this.cache.saveSession(this.session);
-                finish();
+              const picked = EXIT_OPTIONS[exitCursor];
+              if (picked === '保存断点并退出') {
+                if (this.isWrongBook()) {
+                  void run(async () => {
+                    await this.saveProgress();
+                    finish();
+                  });
+                } else {
+                  this.cache.saveSession(this.session);
+                  finish();
+                }
                 return;
               }
-              if (exitCursor === 1) {
+              if (picked === '交卷并退出') {
+                submitAndFinish();
+                return;
+              }
+              if (picked === '不保存退出') {
                 this.cache.clearSession(this.session.courseId, this.session.catId || 'default');
                 finish();
                 return;
@@ -1214,7 +1408,14 @@ export class ExerciseTUI {
             }
             if (key === 'up') this.wrongCursor = Math.max(0, this.wrongCursor - 1);
             else if (key === 'down') this.wrongCursor = Math.min(items.length - 1, this.wrongCursor + 1);
-            else if (data === '\r' || data === '\n') {
+            else if (key === 'x') {
+              const target = items[this.wrongCursor];
+              if (target) applyRemove(target.index);
+              if (!this.isRunning) return;
+              const nextItems = this.wrongItems();
+              if (!nextItems.length) this.wrongMode = false;
+              else this.wrongCursor = Math.min(this.wrongCursor, nextItems.length - 1);
+            } else if (data === '\r' || data === '\n') {
               if (items[this.wrongCursor]) {
                 this.jumpTo(items[this.wrongCursor].index + 1);
                 this.wrongMode = false;
@@ -1329,6 +1530,10 @@ export class ExerciseTUI {
             // K：闪卡抽卡复习
             if (!this.openCardReview()) setStatus('闪卡集为空：答错题目后按 Y 加入闪卡', 'info');
             redraw();
+          } else if (key === 'x') {
+            applyRemove(this.session.currentIndex);
+          } else if (key === 'm') {
+            setStatus(this.markCurrentMastered(), 'success');
           } else if (key === 'y' && current && current.doResult === -1 && this.onAddCard) {
             // Y：答错后确认，AI 组卡入集（相似错题 = 本 session 其他错题）
             const cardCtx = {

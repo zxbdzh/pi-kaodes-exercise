@@ -192,3 +192,119 @@ test('KaodesExtension - /kaodes version 报告版本号与构建目录', async (
   assert.ok(notifications[0].includes('构建目录'), `应含构建目录: ${notifications[0]}`);
 });
 
+test('KaodesExtension - 错题本走数字 courseID 而不是 productId', async () => {
+  const tmpConfig = path.join(os.tmpdir(), `test-wrong-course-${Date.now()}.json`);
+  const tmpCache = path.join(os.tmpdir(), `test-wrong-cache-${Date.now()}`);
+  const ext = new KaodesExtension({ configPath: tmpConfig, cacheDir: tmpCache });
+  let requestedCourseId = '';
+
+  ext.client = {
+    getUserProductList: async () => [{ productId: 37487638, name: '测试科目' }],
+    getCourseList: async () => [{ courseID: '25390', courseName: '测试课程', cstid: 40201 }],
+    getWrongPractice: async (courseId: string) => {
+      requestedCourseId = courseId;
+      return {
+        lastPosition: 2,
+        exerList: [
+          { exerId: 1, title: '错题1', keyType: '单选', newKeyType: 1, a: 'A', b: 'B', rightKey: 'A', userKey: 'A' },
+          { exerId: 2, title: '错题2', keyType: '单选', newKeyType: 1, a: 'A', b: 'B', rightKey: 'B', userKey: null },
+        ],
+      };
+    },
+  } as any;
+
+  await ext.startWrongQuestions({
+    ui: {
+      input: async () => undefined,
+      notify: () => undefined,
+      custom: async <T>() => undefined as T,
+    },
+  });
+
+  assert.equal(requestedCourseId, '25390');
+  if (fs.existsSync(tmpCache)) fs.rmSync(tmpCache, { recursive: true });
+});
+
+test('KaodesExtension - 错题本加载过滤已移出题', async () => {
+  const tmpConfig = path.join(os.tmpdir(), `test-wrong-drop-${Date.now()}.json`);
+  const tmpCache = path.join(os.tmpdir(), `test-wrong-drop-cache-${Date.now()}`);
+  const removedPath = path.join(tmpCache, 'removed.json');
+  fs.mkdirSync(tmpCache, { recursive: true });
+  const ext = new KaodesExtension({ configPath: tmpConfig, cacheDir: tmpCache, removedPath });
+  ext.removed.add('25390', 1);
+  const seen: number[] = [];
+
+  ext.client = {
+    getUserProductList: async () => [{ productId: 37487638, name: '测试科目' }],
+    getCourseList: async () => [{ courseID: '25390', courseName: '测试课程', cstid: 40201 }],
+    getWrongPractice: async () => ({
+      lastPosition: 1,
+      exerList: [
+        { exerId: 1, title: '已移出', keyType: '单选', newKeyType: 1, a: 'A', b: 'B' },
+        { exerId: 2, title: '留下', keyType: '单选', newKeyType: 1, a: 'A', b: 'B' },
+      ],
+    }),
+  } as any;
+
+  await ext.startWrongQuestions({
+    ui: {
+      input: async () => undefined,
+      notify: () => undefined,
+      custom: async <T>(factory: any): Promise<T> => {
+        const comp = factory({ requestRender() {} }, undefined, {}, () => undefined);
+        const text = comp.render(80).join('\n');
+        seen.push(text.includes('已移出') ? 1 : 0);
+        seen.push(text.includes('留下') ? 1 : 0);
+        return undefined as T;
+      },
+    },
+  });
+
+  assert.deepEqual(seen, [0, 1]);
+  if (fs.existsSync(tmpCache)) fs.rmSync(tmpCache, { recursive: true });
+});
+
+function wrongUi(notes: string[]) {
+  return {
+    input: async () => undefined,
+    notify: (message: string) => notes.push(message),
+    custom: async <T>() => undefined as T,
+  };
+}
+
+test('KaodesExtension - 错题本空列表、接口失败、Token 失效都只提示不抛出', async () => {
+  const base = () => ({
+    getUserProductList: async () => [{ productId: 37487638, name: '测试科目' }],
+    getCourseList: async () => [{ courseID: '25390', courseName: '测试课程', cstid: 40201 }],
+  });
+
+  const emptyNotes: string[] = [];
+  const emptyExt = new KaodesExtension({
+    configPath: path.join(os.tmpdir(), `test-wrong-empty-${Date.now()}.json`),
+    cacheDir: path.join(os.tmpdir(), `test-wrong-empty-cache-${Date.now()}`),
+  });
+  emptyExt.client = { ...base(), getWrongPractice: async () => ({ exerList: [], lastPosition: 0 }) } as any;
+  await assert.doesNotReject(() => emptyExt.startWrongQuestions({ ui: wrongUi(emptyNotes) }));
+  assert.ok(emptyNotes.some((message) => message.includes('错题本是空的')));
+
+  const apiNotes: string[] = [];
+  const apiExt = new KaodesExtension({
+    configPath: path.join(os.tmpdir(), `test-wrong-api-${Date.now()}.json`),
+    cacheDir: path.join(os.tmpdir(), `test-wrong-api-cache-${Date.now()}`),
+  });
+  apiExt.client = { ...base(), getWrongPractice: async () => { throw new Error('findWrong: 系统异常（code 500）'); } } as any;
+  await assert.doesNotReject(() => apiExt.startWrongQuestions({ ui: wrongUi(apiNotes) }));
+  assert.ok(apiNotes.some((message) => message.includes('接口失败')));
+  assert.ok(!apiNotes.some((message) => message.includes('Token 已失效')));
+
+  const tokenNotes: string[] = [];
+  const tokenExt = new KaodesExtension({
+    configPath: path.join(os.tmpdir(), `test-wrong-token-${Date.now()}.json`),
+    cacheDir: path.join(os.tmpdir(), `test-wrong-token-cache-${Date.now()}`),
+  });
+  tokenExt.client = { ...base(), getWrongPractice: async () => { throw new Error('登录已过期 code 10005'); } } as any;
+  await assert.doesNotReject(() => tokenExt.startWrongQuestions({ ui: wrongUi(tokenNotes) }));
+  assert.ok(tokenNotes.some((message) => message.includes('Token 已失效')));
+  assert.ok(tokenNotes.some((message) => message.includes('不受影响')));
+});
+

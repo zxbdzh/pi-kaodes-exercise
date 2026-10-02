@@ -82,6 +82,16 @@ export class AuthManager {
   /**
    * 持久化配置到本地文件
    */
+  /** 服务端判定登录过期时清掉本地凭证，下次 ensureValidToken 会重新要 Token。 */
+  public invalidate(): void {
+    try {
+      if (fs.existsSync(this.configPath)) fs.unlinkSync(this.configPath);
+    } catch {
+      // 清不掉也不阻塞重输
+    }
+    delete process.env.KAODES_TOKEN;
+  }
+
   public saveConfig(config: KaodesConfig): void {
     const dir = path.dirname(this.configPath);
     if (!fs.existsSync(dir)) {

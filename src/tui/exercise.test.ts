@@ -8,6 +8,8 @@ import { ExerciseTUI, visibleWidth, KAODES_HELP } from './exercise.js';
 import { KaodesClient } from '../api/client.js';
 import { AuthManager } from '../auth/manager.js';
 import { PracticeSession } from '../types.js';
+import { WrongRemovedStore } from '../cache/wrongRemoved.js';
+import { MASTER_STREAK, WrongBookStore } from '../cache/wrongBook.js';
 
 function makeMockSession(): PracticeSession {
   return {
@@ -117,11 +119,14 @@ test('ExerciseTUI & SessionCache - 答题卡渲染与断点离线缓存', async 
         component!.handleInput?.('\r'); // enter：确认光标所在选项 A
         assert.equal(mockSession.exercises[0].userKey, 'A');
         component!.handleInput?.('\x1b'); // esc：组件内自绘退出对话框
-        assert.ok(component!.render(80).some((line) => line.includes('退出练习')), '应渲染退出对话框');
+        const exitLines = component!.render(80);
+        assert.ok(exitLines.some((line) => line.includes('退出练习')), '应渲染退出对话框');
+        assert.ok(exitLines.some((line) => line.includes('交卷并退出')), '退出菜单应能交卷');
         component!.handleInput?.('\x1b'); // 再按 esc：继续答题
         assert.ok(!component!.render(80).some((line) => line.includes('退出练习')));
         component!.handleInput?.('\x1b'); // 重新打开
-        component!.handleInput?.('\x1b[B'); // ↓ 移到「不保存退出」
+        component!.handleInput?.('\x1b[B'); // ↓ 交卷并退出
+        component!.handleInput?.('\x1b[B'); // ↓ 不保存退出
         component!.handleInput?.('\r'); // Enter → 清断点并结束
       });
       return undefined as T;
@@ -412,5 +417,139 @@ test('ExerciseTUI - LLM 高亮：AI 抽取的词叠加渲染（规则未覆盖�
     input: async () => undefined,
     notify: () => undefined,
   });
+  if (fs.existsSync(tmpCacheDir)) fs.rmSync(tmpCacheDir, { recursive: true });
+});
+
+test('ExerciseTUI - 错题本走 submitWrongStore，章节假 prId 不提交', async () => {
+  const tmpCacheDir = path.join(os.tmpdir(), `test-local-prid-${Date.now()}`);
+  const cache = new SessionCache(tmpCacheDir);
+  const session = makeMockSession();
+  session.prId = Date.now();
+  session.catId = 'wrong';
+  session.courseId = '25390';
+  let chapterCalls = 0;
+  let wrongCalls = 0;
+  let lastFinish: number | undefined;
+  const client = {
+    savePractice: async () => {
+      chapterCalls += 1;
+    },
+    submitPractice: async () => {
+      chapterCalls += 1;
+    },
+    submitWrongStore: async (params: { isFinish: number }) => {
+      wrongCalls += 1;
+      lastFinish = params.isFinish;
+      return { code: 200, flag: true, message: 'ok', data: { correctNum: 1, errorNum: 1, exerNum: 2, correctRate: '50%', createDate: '' } };
+    },
+  } as unknown as KaodesClient;
+  const tui = new ExerciseTUI(session, client, cache);
+  await tui.saveProgress();
+  assert.equal(chapterCalls, 0);
+  assert.equal(wrongCalls, 1);
+  assert.equal(lastFinish, 0);
+  const result = await tui.submitProgress();
+  assert.equal(chapterCalls, 0);
+  assert.equal(wrongCalls, 2);
+  assert.equal(lastFinish, 1);
+  assert.equal(result.data.exerNum, 2);
+  if (fs.existsSync(tmpCacheDir)) fs.rmSync(tmpCacheDir, { recursive: true });
+});
+
+test('ExerciseTUI - 错题本 X 移出当前题，章节练习不移出', async () => {
+  const tmpCacheDir = path.join(os.tmpdir(), `test-drop-${Date.now()}`);
+  const removedFile = path.join(tmpCacheDir, 'removed.json');
+  const cache = new SessionCache(tmpCacheDir);
+  const session = makeMockSession();
+  session.catId = 'wrong';
+  session.courseId = '25390';
+  const removed = new WrongRemovedStore(removedFile);
+  const client = {
+    submitWrongStore: async () => ({ code: 200, flag: true, message: 'ok', data: { correctNum: 0, errorNum: 0, exerNum: 1, correctRate: '0%', createDate: '' } }),
+  } as unknown as KaodesClient;
+  const tui = new ExerciseTUI(session, client, cache, undefined, { removed });
+  assert.equal(tui.removeWrongAt(0), 'ok');
+  assert.equal(session.exercises.length, 1);
+  assert.equal(session.exercises[0].exerId, 2);
+  assert.equal(session.currentIndex, 0);
+  assert.equal(removed.has('25390', 1), true);
+  assert.equal(tui.removeWrongAt(0), 'empty');
+  assert.equal(session.exercises.length, 0);
+
+  const chapter = makeMockSession();
+  const chapterTui = new ExerciseTUI(chapter, client, cache, undefined, { removed });
+  assert.equal(chapterTui.removeWrongAt(0), 'skip');
+  assert.equal(chapter.exercises.length, 2);
+  assert.ok(KAODES_HELP.includes('移出当前题'));
+  assert.ok(KAODES_HELP.includes('待复习'));
+  if (fs.existsSync(tmpCacheDir)) fs.rmSync(tmpCacheDir, { recursive: true });
+});
+
+test('ExerciseTUI - 错题本连续做对可掌握，章节练习不记账', async () => {
+  const tmpCacheDir = path.join(os.tmpdir(), `test-streak-${Date.now()}`);
+  const cache = new SessionCache(tmpCacheDir);
+  const book = new WrongBookStore(path.join(tmpCacheDir, 'book.json'));
+  const client = {
+    submitWrongStore: async () => ({ code: 200, flag: true, message: 'ok', data: { correctNum: 0, errorNum: 0, exerNum: 1, correctRate: '0%', createDate: '' } }),
+  } as unknown as KaodesClient;
+
+  const chapter = makeMockSession();
+  const chapterTui = new ExerciseTUI(chapter, client, cache, undefined, { book });
+  chapterTui.selectAnswer('B');
+  assert.equal(book.get('25390', 1), undefined);
+  assert.equal(chapter.exercises.length, 2);
+
+  const session = makeMockSession();
+  session.catId = 'wrong';
+  session.chapterName = '错题本精练攻坚';
+  const tui = new ExerciseTUI(session, client, cache, undefined, { book });
+  tui.selectAnswer('B');
+  assert.equal(tui.takeCoachNote().includes('已重新计入'), true);
+  tui.selectAnswer('A');
+  assert.equal(tui.takeCoachNote(), '连续做对 1 次');
+  session.exercises[0].userKey = null;
+  session.exercises[0].doResult = 0;
+  tui.selectAnswer('A');
+  assert.ok(tui.takeCoachNote().includes(`连续做对 ${MASTER_STREAK} 次`));
+  assert.equal(tui.markCurrentMastered().includes('已标为掌握'), true);
+  assert.equal(book.get('25390', 1)?.mastered, true);
+  tui.selectAnswer('B');
+  const missed = book.get('25390', 1);
+  assert.equal(missed?.mastered, false);
+  assert.equal(missed?.streak, 0);
+  assert.ok((missed?.priority || 0) > 1);
+  if (fs.existsSync(tmpCacheDir)) fs.rmSync(tmpCacheDir, { recursive: true });
+});
+
+test('ExerciseTUI - Esc 菜单交卷并退出', async () => {
+  const tmpCacheDir = path.join(os.tmpdir(), `test-esc-submit-${Date.now()}`);
+  const cache = new SessionCache(tmpCacheDir);
+  const session = makeMockSession();
+  let submitted = 0;
+  const client = {
+    submitPractice: async () => {
+      submitted += 1;
+      return { code: 200, flag: true, message: 'ok', data: { correctNum: 1, errorNum: 1, exerNum: 2, correctRate: '50%', createDate: '' } };
+    },
+    addWrong: async () => undefined,
+  } as unknown as KaodesClient;
+  const tui = new ExerciseTUI(session, client, cache);
+  const notified: string[] = [];
+  await tui.startInPi({
+    custom: async <T>(factory: any): Promise<T> => {
+      await new Promise<void>((resolve) => {
+        const component = factory({ requestRender() {} }, undefined, {}, () => resolve());
+        component.handleInput('\x1b');
+        component.handleInput('\x1b[B');
+        component.handleInput('\r');
+      });
+      return undefined as T;
+    },
+    input: async () => undefined,
+    notify: (message: string) => notified.push(message),
+  });
+  assert.equal(submitted, 1);
+  assert.ok(notified.some((message) => message.includes('提交完成')));
+  assert.equal(cache.loadSession('25390', '10015493'), null);
   if (fs.existsSync(tmpCacheDir)) fs.rmSync(tmpCacheDir, { recursive: true });
 });

@@ -1,14 +1,18 @@
+import path from 'node:path';
 import { AuthManager } from './auth/manager.js';
 import { CourseListItem, KaodesClient, ProductItem } from './api/client.js';
 import { SessionCache } from './cache/session.js';
+import { WrongBookStore, chapterOf } from './cache/wrongBook.js';
+import { WrongRemovedStore } from './cache/wrongRemoved.js';
 import { Preferences } from './config/preferences.js';
 import { buildStatsReport } from './stats/report.js';
 import { ExerciseTUI, KAODES_HELP, extractMemoryCard } from './tui/exercise.js';
+import { openWrongBook, WrongBookRow } from './tui/wrongBook.js';
 import { FlashcardStore } from './cards/store.js';
 import { parseHighlightBlock, parseLooseHighlight, paintAiAnswer, marksForAnswer, stripMd } from './tui/highlight.js';
 import { PAGED_SELECT_BACK, pagedSelect } from './tui/pagedSelect.js';
 import { AiTutorEngine } from './tutor/engine.js';
-import { ChapterPracticeNode, ChatTurn, PracticeSession } from './types.js';
+import { ChapterPracticeNode, ChatTurn, ExerciseItem, PracticeSession } from './types.js';
 
 /** 插件版本号，需与 package.json 的 version 保持一致。 */
 export const PLUGIN_VERSION = '1.3.0';
@@ -98,6 +102,29 @@ export interface PiExtensionContext {
   sendMessage?: (msg: string) => void;
 }
 
+function wrongFailureKind(error: unknown): 'token' | 'api' {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/token|登录|过期|10005|401|未授权|unauthorized/i.test(message)) return 'token';
+  return 'api';
+}
+
+function majorityCourse(rows: Array<{ courseId: string }>): string {
+  const counts = new Map<string, number>();
+  for (const row of rows) {
+    if (!row.courseId) continue;
+    counts.set(row.courseId, (counts.get(row.courseId) || 0) + 1);
+  }
+  let best = '';
+  let bestCount = 0;
+  for (const [courseId, count] of counts) {
+    if (count > bestCount) {
+      best = courseId;
+      bestCount = count;
+    }
+  }
+  return best;
+}
+
 /**
  * Pi 插件核心管理器
  */
@@ -113,14 +140,22 @@ export class KaodesExtension {
   public piModel?: unknown;
   /** 闪卡集：答错入卡 + K 抽卡复习，持久化到 ~/.pi/kaodes-flashcards.json */
   public cards: FlashcardStore;
+  /** 错题本移出名单：~/.pi/kaodes-wrong-removed.json */
+  public removed: WrongRemovedStore;
+  /** 错题本次数 / 掌握 / 错因：~/.pi/kaodes-wrong-book.json */
+  public book: WrongBookStore;
 
-  constructor(options?: { configPath?: string; cacheDir?: string; prefsPath?: string; cardsPath?: string }) {
+  constructor(options?: { configPath?: string; cacheDir?: string; prefsPath?: string; cardsPath?: string; removedPath?: string; bookPath?: string }) {
     this.auth = new AuthManager(options?.configPath);
     this.client = new KaodesClient(this.auth);
     this.cache = new SessionCache(options?.cacheDir);
     this.tutor = new AiTutorEngine();
     this.prefs = new Preferences(options?.prefsPath);
     this.cards = new FlashcardStore(options?.cardsPath);
+    this.removed = new WrongRemovedStore(options?.removedPath);
+    this.book = new WrongBookStore(
+      options?.bookPath || (options?.cacheDir ? path.join(options.cacheDir, 'wrong-book.json') : undefined)
+    );
   }
 
   /**
@@ -138,6 +173,8 @@ export class KaodesExtension {
         highlightEnabled: this.prefs.highlightEnabled,
         onHighlightChange: (on) => this.prefs.setHighlightEnabled(on),
         cards: this.cards,
+        removed: this.removed,
+        book: this.book,
       }
     );
   }
@@ -370,28 +407,53 @@ export class KaodesExtension {
     await this.runTui(tui, commandContext);
   }
 
+  /** 科目 → 课程。daily/wrong 要用数字 courseID（25390），不是 productId。 */
+  private async resolveDefaultCourse(): Promise<{
+    product: ProductItem;
+    courseId: string;
+    cstId: number;
+    name: string;
+  } | null> {
+    const products = await this.client.getUserProductList();
+    if (!products.length) return null;
+    const product = products[0];
+    const rows = product.courseId
+      ? [{ courseID: String(product.courseId), courseName: product.name, cstid: 0 }]
+      : await this.client.getCourseList(product.productId);
+    const course = rows[0];
+    if (!course?.courseID) return null;
+    return {
+      product,
+      courseId: String(course.courseID),
+      cstId: Number(course.cstid) || 0,
+      name: course.courseName || product.name,
+    };
+  }
+
   /**
    * 启动每日一练
    */
   public async startDailyExercise(commandContext?: PiCommandContext): Promise<void> {
-    const products = await this.client.getUserProductList();
-    if (!products.length) return;
-    const prod = products[0];
+    const picked = await this.resolveDefaultCourse();
+    if (!picked) {
+      commandContext?.ui.notify('未查询到已购买的科目，请先确认账号或 Token 状态。', 'warning');
+      return;
+    }
 
-    console.log(`\n[Kaodes] 正在拉取《${prod.name}》每日一练...`);
-    const exercises = await this.client.getEverydayExercises(String(prod.productId));
+    console.log(`\n[Kaodes] 正在拉取《${picked.name}》每日一练...`);
+    const exercises = await this.client.getEverydayExercises(picked.courseId);
     if (!exercises.length) {
-      console.log('[Kaodes] 今日每日一练已完成或暂无题目。');
+      commandContext?.ui.notify('今日每日一练已完成或暂无题目。', 'info');
       return;
     }
 
     const session: PracticeSession = {
       prId: Date.now(),
       scoringMethod: 1,
-      courseId: String(prod.productId),
-      courseName: prod.name,
-      productId: prod.productId,
-      cstId: 0,
+      courseId: picked.courseId,
+      courseName: picked.name,
+      productId: picked.product.productId,
+      cstId: picked.cstId,
       catId: 'daily',
       chapterName: '每日一练 (精选10题)',
       exercises: exercises.map((e, idx) => ({
@@ -411,73 +473,219 @@ export class KaodesExtension {
   }
 
   /**
-   * 启动错题本复习：云端错题本优先，接口异常时回落到本地断点中答错的题（不依赖云端）。
+   * 启动错题本：先列表（题量 / 待复习 / 已掌握），再进入现有答题卡。
+   * 云端失败或 Token 失效只提示错题本，不抛到其他练习模式。
    */
   public async startWrongQuestions(commandContext?: PiCommandContext): Promise<void> {
+    commandContext?.ui.notify('正在加载错题本…', 'info');
+    let picked: Awaited<ReturnType<KaodesExtension['resolveDefaultCourse']>> = null;
+    let cloud: ExerciseItem[] | null = null;
+    let lastPosition = 0;
+    let failure: 'token' | 'api' | null = null;
+    let failureText = '';
     try {
-      const products = await this.client.getUserProductList();
-      if (products.length) {
-        const prod = products[0];
-        const wrongs = await this.client.getWrongQuestions(String(prod.productId));
-        if (wrongs.length) {
-          await this.runWrongSession(prod.productId, prod.name, '错题本精练攻坚', wrongs, commandContext);
-          return;
-        }
+      picked = await this.resolveDefaultCourse();
+      if (picked) {
+        const practice = await this.client.getWrongPractice(picked.courseId);
+        cloud = practice.exerList || [];
+        lastPosition = Number(practice.lastPosition) || 0;
       }
-    } catch {
-      // 云端错题本接口异常（如 errorsCollect/findWrong 500），回落本地
+    } catch (error) {
+      failure = wrongFailureKind(error);
+      failureText = error instanceof Error ? error.message : String(error);
     }
 
-    // 本地回落：收集所有断点 session 里答错的题（按题去重）
     const local = this.collectLocalWrong();
-    if (!local.length) {
-      commandContext?.ui.notify('云端错题本暂不可用，且本地断点没有错题记录。', 'warning');
+    const courseId = picked?.courseId || majorityCourse(local);
+    const localForCourse = local.filter((row) => !courseId || row.courseId === courseId);
+    let source: Array<{ item: ExerciseItem; chapter: string }> = [];
+    let banner = '';
+
+    if (failure === 'token') {
+      commandContext?.ui.notify(
+        'Token 已失效，云端错题本没有打开。请执行 /kaodes login。章节练习、每日一练、模拟考试和闯关不受影响。',
+        'error'
+      );
+      if (!localForCourse.length) return;
+      source = localForCourse;
+      banner = 'Token 失效，下面只显示本地做错的题。';
+    } else if (failure === 'api') {
+      commandContext?.ui.notify(`错题本接口失败：${failureText}。其他练习模式不受影响。`, 'warning');
+      if (!localForCourse.length) return;
+      source = localForCourse;
+      banner = '接口失败，下面是本地错题。';
+    } else if (!picked) {
+      commandContext?.ui.notify('未查询到已购买的科目，请先确认账号或 Token 状态。其他练习模式不受影响。', 'warning');
+      if (!localForCourse.length) return;
+      source = localForCourse;
+      banner = '没有课程信息，下面是本地错题。';
+    } else if (!cloud?.length) {
+      if (!localForCourse.length) {
+        commandContext?.ui.notify('错题本是空的。先做章节练习，做错的题会出现在这里。', 'info');
+        return;
+      }
+      source = localForCourse;
+      banner = '云端错题本没有题，这是本地做错的题。';
+    } else {
+      source = cloud.map((item) => ({
+        item,
+        chapter: this.chapterFromSessions(Number(item.exerId || item.exerID || 0)),
+      }));
+    }
+
+    const rows = this.buildWrongRows(courseId, source);
+    if (!rows.length) {
+      commandContext?.ui.notify('错题本是空的。', 'info');
       return;
     }
-    commandContext?.ui.notify(
-      `云端错题本暂不可用，已改用本地错题重练：${local.length} 道`,
-      'info'
+
+    const productId = picked?.product.productId || 0;
+    const courseName = picked?.name || '本地错题';
+    const cloudReady = failure === null && !!cloud?.length;
+    const openPractice = async (items: ExerciseItem[], position: number, chapterName: string) => {
+      if (!items.length) return;
+      await this.runWrongSession({
+        productId,
+        courseId: courseId || '0',
+        courseName,
+        chapterName,
+        wrongs: items,
+        lastPosition: position,
+      }, commandContext);
+    };
+
+    if (!commandContext?.ui.custom) {
+      const pending = rows.filter((row) => !row.removed);
+      if (!pending.length) {
+        commandContext?.ui.notify('这些错题已全部移出。', 'info');
+        return;
+      }
+      await openPractice(
+        pending.map((row) => row.item),
+        lastPosition,
+        cloudReady ? '错题本精练攻坚' : '错题本·本地重练'
+      );
+      return;
+    }
+
+    const done = await openWrongBook(commandContext.ui, {
+      courseName,
+      banner,
+      pageSize: this.prefs.pageSize,
+      entries: rows,
+      onMaster: (exerId) => {
+        if (courseId) this.book.markMastered(courseId, exerId);
+      },
+      onRestore: (exerId) => {
+        if (!courseId) return;
+        this.removed.restore(courseId, exerId);
+        this.book.restore(courseId, exerId);
+      },
+      onRemove: (exerId) => {
+        if (courseId) this.removed.add(courseId, exerId);
+      },
+    });
+    if (!done) return;
+    await openPractice(
+      done.items,
+      done.index + 1,
+      done.again ? '错题本·重练' : cloudReady ? '错题本精练攻坚' : '错题本·本地重练'
     );
-    await this.runWrongSession(0, '本地错题', '错题本·本地重练', local, commandContext);
   }
 
-  /** 收集本地所有断点里答错的题（按 exerId 去重，重置作答状态）。 */
-  private collectLocalWrong(): import('./types.js').ExerciseItem[] {
-    const byId = new Map<number, import('./types.js').ExerciseItem>();
+  /** 收集本地断点里答错的题（按 exerId 去重）。移出的题也留下，列表里才能恢复。 */
+  private collectLocalWrong(): Array<{ courseId: string; item: ExerciseItem; chapter: string }> {
+    const byId = new Map<number, { courseId: string; item: ExerciseItem; chapter: string }>();
     for (const session of this.cache.listSessions()) {
+      const chapter = chapterOf({}, session.chapterName);
       for (const item of session.exercises || []) {
-        if (item.doResult === -1 && item.exerId && !byId.has(item.exerId)) {
-          byId.set(item.exerId, { ...item, doResult: 0, userKey: null, viewAnswer: 0 });
-        }
+        if (item.doResult !== -1 || !item.exerId || byId.has(item.exerId)) continue;
+        byId.set(item.exerId, {
+          courseId: session.courseId,
+          chapter,
+          item: { ...item, doResult: 0, userKey: null, viewAnswer: 0 },
+        });
       }
     }
     return [...byId.values()];
   }
 
+  private chapterFromSessions(exerId: number): string {
+    if (!exerId) return '';
+    for (const session of this.cache.listSessions()) {
+      if (session.catId === 'wrong') continue;
+      const hit = (session.exercises || []).some((item) => Number(item.exerId || item.exerID) === exerId);
+      if (!hit) continue;
+      const name = chapterOf({}, session.chapterName);
+      if (name !== '未分章') return name;
+    }
+    return '';
+  }
+
+  private buildWrongRows(
+    courseId: string,
+    source: Array<{ item: ExerciseItem; chapter: string }>
+  ): WrongBookRow[] {
+    const byId = new Map<number, WrongBookRow>();
+    for (const { item, chapter } of source) {
+      const exerId = Number(item.exerId || item.exerID || 0);
+      if (!exerId || byId.has(exerId)) continue;
+      const named = chapterOf(item, chapter);
+      let meta = null as ReturnType<WrongBookStore['get']> | null;
+      try {
+        meta = courseId ? this.book.ensure(courseId, exerId, named) : null;
+      } catch {
+        meta = null;
+      }
+      byId.set(exerId, {
+        item,
+        title: item.title || `题目 ${exerId}`,
+        chapter: meta?.chapter || named,
+        wrongCount: meta?.wrongCount ?? 1,
+        streak: meta?.streak ?? 0,
+        mastered: !!meta?.mastered,
+        removed: !!(courseId && this.removed.has(courseId, exerId)),
+        lastWrongAt: meta?.lastWrongAt ?? 0,
+        priority: meta?.priority ?? 1,
+        reason: meta?.reason || '还没有本地错因。做一遍后会记下误选，并只提示概念界限。',
+      });
+    }
+    return [...byId.values()];
+  }
+
   private async runWrongSession(
-    productId: number,
-    courseName: string,
-    chapterName: string,
-    wrongs: import('./types.js').ExerciseItem[],
+    opts: {
+      productId: number;
+      courseId: string;
+      courseName: string;
+      chapterName: string;
+      wrongs: import('./types.js').ExerciseItem[];
+      lastPosition: number;
+    },
     commandContext?: PiCommandContext
   ): Promise<void> {
+    const exercises = opts.wrongs.map((item, idx) => {
+      const exerId = item.exerID || item.exerId || idx + 1;
+      const userKey = item.userKey || null;
+      const doResult = userKey && item.rightKey ? (userKey === item.rightKey ? 1 : -1) : 0;
+      return { ...item, exerId, userKey, doResult, viewAnswer: 0 };
+    });
+    const maxIndex = Math.max(0, exercises.length - 1);
+    const currentIndex = opts.lastPosition > 0
+      ? Math.min(Math.max(opts.lastPosition - 1, 0), maxIndex)
+      : 0;
+
     const session: PracticeSession = {
       prId: Date.now(),
       scoringMethod: 1,
-      courseId: String(productId),
-      courseName,
-      productId,
+      courseId: opts.courseId,
+      courseName: opts.courseName,
+      productId: opts.productId,
       cstId: 0,
       catId: 'wrong',
-      chapterName,
-      exercises: wrongs.map((e, idx) => ({
-        ...e,
-        exerId: e.exerID || e.exerId || idx + 1,
-        doResult: 0,
-        userKey: null,
-        viewAnswer: 0,
-      })),
-      currentIndex: 0,
+      chapterName: opts.chapterName,
+      exercises,
+      currentIndex,
       startTime: Date.now(),
       runSecond: 0,
     };
@@ -584,7 +792,7 @@ export class KaodesExtension {
     try {
       const message = (await registry.complete(model, {
         systemPrompt:
-          '你是备考伴学导师。回答学员关于当前题目的问题，简练准确。' +
+          '你是备考伴学导师。只帮学员定位概念界限，不直接给出正确选项或答案原文。回答简练。' +
           '请在回答最末尾追加一行高亮标注，用于在题干/选项上标出考点，格式严格为：\n' +
           '【高亮】题眼:<考点词,逗号分隔>;易错:<否定或陷阱词>;结论:<结论落点词>\n' +
           '只填当前题目原文里确实出现的词，每类可留空，词长 2-12 字，不要编造。',
@@ -645,7 +853,7 @@ ${
       exer.d ? `D. ${exer.d}
 ` : ''
     }${exer.userKey ? `【我的作答】${exer.userKey}
-` : ''}
+` : ''}只帮我定位概念界限，不要直接给出正确选项。
 【我的问题】${question.trim()}`;
   }
 

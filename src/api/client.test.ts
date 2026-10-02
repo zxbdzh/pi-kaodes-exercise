@@ -45,6 +45,24 @@ test('KaodesClient - 接口封装与请求格式验证', async () => {
           ]
         }
       }));
+    } else if (capturedPath.includes('errorsCollect/submitWrongStore')) {
+      res.end(JSON.stringify({
+        code: 200,
+        flag: true,
+        data: { correctNum: 1, errorNum: 0, exerNum: 1, correctRate: '100%', createDate: '2026-09-20' },
+      }));
+    } else if (capturedPath.includes('errorsCollect/findWrong')) {
+      res.end(JSON.stringify({
+        code: 200,
+        flag: true,
+        data: { exerList: [{ exerID: 3869357, title: '错题1', rightKey: 'D' }], lastPosition: 3 },
+      }));
+    } else if (capturedPath.includes('userExercises/getEverydayExercises')) {
+      res.end(JSON.stringify({
+        code: 200,
+        flag: true,
+        data: { exerList: [{ exerID: 1, title: '每日1', rightKey: 'A' }], exerNum: 1 },
+      }));
     } else if (capturedPath.includes('course/submitPractice')) {
       res.end(JSON.stringify({
         code: 200,
@@ -115,6 +133,31 @@ test('KaodesClient - 接口封装与请求格式验证', async () => {
 
   const challengeList = await client.getChallengeGroupList('25390');
   assert.equal(Array.isArray(challengeList), true);
+
+  const wrongPractice = await client.getWrongPractice('25390');
+  assert.equal(wrongPractice.exerList.length, 1);
+  assert.equal(wrongPractice.lastPosition, 3);
+  assert.ok(capturedPath.includes('type=1'));
+  assert.ok(capturedPath.includes('source=1'));
+
+  const wrongs = await client.getWrongQuestions('25390');
+  assert.equal(wrongs.length, 1);
+  assert.equal(wrongs[0].exerID, 3869357);
+
+  const wrongSave = await client.submitWrongStore({
+    courseId: '25390',
+    isFinish: 0,
+    lastPosition: 3,
+    exercises: [{ exerID: 3869357, score: 0, userKey: 'C' }],
+  });
+  assert.equal(wrongSave.data.correctNum, 1);
+  assert.ok(capturedPath.includes('submitWrongStore'));
+  assert.ok(capturedPath.includes('courseId=25390'));
+  assert.ok(capturedBody.includes('"isFinish":0'));
+
+  const daily = await client.getEverydayExercises('25390');
+  assert.equal(daily.length, 1);
+  assert.equal(daily[0].title, '每日1');
 
   await new Promise<void>((resolve) => server.close(() => resolve()));
 });

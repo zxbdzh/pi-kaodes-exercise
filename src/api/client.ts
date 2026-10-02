@@ -115,9 +115,9 @@ export class KaodesClient {
       body: reqBody,
     }, endpoint);
 
-    if (res.status === 401) {
-      // Token 过期失效
-      console.warn('\n[Kaodes] 401 未授权，请更新 Token。');
+    if (res.status === 401 || (await this.isLoginExpired(res))) {
+      this.authManager.invalidate();
+      console.warn('\n[Kaodes] 登录已过期，请更新 Token。');
       const newToken = await this.authManager.promptForToken();
       headers.token = newToken;
       const retryRes = await this.fetchWithRetry(url, {
@@ -129,6 +129,16 @@ export class KaodesClient {
     }
 
     return this.parseResponse<T>(res, endpoint);
+  }
+
+  /** 官网过期常返回 HTTP 200 + code 10005，不是 401。 */
+  private async isLoginExpired(res: Response): Promise<boolean> {
+    try {
+      const payload = (await res.clone().json()) as { code?: number };
+      return payload?.code === 10005;
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -437,28 +447,73 @@ export class KaodesClient {
   }
 
   /**
-   * 查询错题本列表
+   * 查询错题本题目与断点。官网 findWrong 必须带 type+source，题目在 exerList。
    */
-  public async getWrongQuestions(courseId: string, pageNum = 1, pageSize = 20): Promise<ExerciseItem[]> {
-    const res = await this.request<{ rows: ExerciseItem[] } | ExerciseItem[]>('errorsCollect/findWrong', {
-      method: 'GET',
-      params: { courseId, pageNum, pageSize },
+  public async getWrongPractice(courseId: string): Promise<{ exerList: ExerciseItem[]; lastPosition: number }> {
+    const res = await this.request<{ exerList?: ExerciseItem[]; lastPosition?: number }>(
+      'errorsCollect/findWrong',
+      {
+        method: 'GET',
+        params: { courseId, type: 1, source: 1 },
+      }
+    );
+    return {
+      exerList: res.data?.exerList || [],
+      lastPosition: Number(res.data?.lastPosition) || 0,
+    };
+  }
+
+  public async getWrongQuestions(courseId: string): Promise<ExerciseItem[]> {
+    return (await this.getWrongPractice(courseId)).exerList;
+  }
+
+  /** 错题本存档/交卷。isFinish=0 下次继续，=1 提交。 */
+  public async submitWrongStore(params: {
+    courseId: string;
+    isFinish: number;
+    lastPosition: number;
+    learningType?: number;
+    exercises: Array<{
+      exerID: number;
+      score: number;
+      starCount?: number;
+      userKey?: string | null;
+      userKeyImg1?: string;
+      userKeyImg2?: string;
+      userKeyImg3?: string;
+      sonExer?: unknown[];
+    }>;
+  }): Promise<ApiResponse<SubmitPracticeResult>> {
+    const courseId = params.courseId;
+    return this.request<SubmitPracticeResult>('errorsCollect/submitWrongStore', {
+      method: 'POST',
+      isJson: true,
+      params: { type: 1, courseId },
+      body: {
+        courseId,
+        type: 1,
+        exercises: params.exercises,
+        isFinish: params.isFinish,
+        learningType: params.learningType ?? 21,
+        lastPosition: params.lastPosition,
+      },
     });
-    if (Array.isArray(res.data)) return res.data;
-    if (res.data && 'rows' in res.data) return res.data.rows;
-    return [];
   }
 
   /**
-   * 获取每日一练题目列表
+   * 获取每日一练题目。官网 data.exerList，courseId 必须是数字课程 id（如 25390）。
    */
   public async getEverydayExercises(courseId: string): Promise<ExerciseItem[]> {
-    const res = await this.request<{ exercises: ExerciseItem[] } | ExerciseItem[]>('userExercises/getEverydayExercises', {
-      method: 'GET',
-      params: { courseId },
-    });
+    const res = await this.request<{ exercises?: ExerciseItem[]; exerList?: ExerciseItem[] } | ExerciseItem[]>(
+      'userExercises/getEverydayExercises',
+      {
+        method: 'GET',
+        params: { courseId },
+      }
+    );
     if (Array.isArray(res.data)) return res.data;
-    if (res.data && 'exercises' in res.data) return res.data.exercises;
+    if (res.data && Array.isArray(res.data.exerList)) return res.data.exerList;
+    if (res.data && Array.isArray(res.data.exercises)) return res.data.exercises;
     return [];
   }
 }

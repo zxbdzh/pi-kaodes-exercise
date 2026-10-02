@@ -38,5 +38,12 @@ test('AuthManager - JWT 解析与有效性检测', () => {
   assert.equal(loaded.token, validToken);
   assert.equal(loaded.userId, 8319835);
 
+  const prevEnv = process.env.KAODES_TOKEN;
+  auth.invalidate();
+  assert.equal(fs.existsSync(tmpConfig), false);
+  assert.equal(auth.getToken(), null);
+  if (prevEnv !== undefined) process.env.KAODES_TOKEN = prevEnv;
+  else delete process.env.KAODES_TOKEN;
+
   if (fs.existsSync(tmpConfig)) fs.unlinkSync(tmpConfig);
 });

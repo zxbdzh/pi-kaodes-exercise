@@ -32,15 +32,19 @@ test('AiTutorEngine - 点拨防剧透 Prompt 与反问闪卡生成', async () =>
   assert.ok(hintPrompt.includes('关于创新性发展的定义'));
   assert.ok(hintPrompt.includes('用户选择了: B'));
   assert.ok(hintPrompt.includes('绝对不要直接说出正确选项'));
+  assert.ok(hintPrompt.includes('概念界限'));
 
   // 2. 反问闪卡 Prompt 构建
   const flashcardPrompt = engine.buildFlashcardPrompt(mockExer);
   assert.ok(flashcardPrompt.includes('反问闪卡'));
   assert.ok(flashcardPrompt.includes('苏格拉底式教学'));
+  assert.ok(flashcardPrompt.includes('概念界限'));
+  assert.ok(!flashcardPrompt.includes('参考解析'));
 
   // 3. 离线 Fallback 点拨与闪卡
   const fallbackHint = engine.generateFallbackHint(mockExer);
   assert.ok(fallbackHint.includes('AI 核心思路点拨'));
+  assert.ok(!fallbackHint.includes('按照时代的新进步'));
 
   const mockExerLocal = mockExer;
   const fallbackCard = engine.fallbackFlashcard(mockExer);

@@ -2,6 +2,13 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 新增
+
+- **错题本移出（X / `:drop`）**：`/kaodes wrong` 里按 `X` 把当前题移出本机名单（`~/.pi/kaodes-wrong-removed.json`），下次不再出现。W 回顾列表同样可用。不调用云端 `removeWrong`（`type=0/2` 会清空整本）。
+- **Esc 退出菜单可交卷**：增加「交卷并退出」，与 Q / `:submit` 同一条提交路径。
+
 ## [1.3.0] - 2026-09-19
 
 ### 新增
